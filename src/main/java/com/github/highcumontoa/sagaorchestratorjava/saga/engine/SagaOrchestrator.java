@@ -1,0 +1,564 @@
+package com.github.highcumontoa.sagaorchestratorjava.saga.engine;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.highcumontoa.sagaorchestratorjava.saga.exception.RejectReason;
+import com.github.highcumontoa.sagaorchestratorjava.saga.exception.SagaRejectedException;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.ActionContext;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.AttemptRecord;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaDefinition;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaInstance;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaSnapshot;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.StepDefinition;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.StepExecution;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.SubmitResult;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.TraceEvent;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.TraceType;
+import com.github.highcumontoa.sagaorchestratorjava.saga.store.IdempotentActionGuard;
+import com.github.highcumontoa.sagaorchestratorjava.saga.store.SagaStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * 分布式事务编排器（本地存储版）。
+ *
+ * <p>核心保证：
+ * <ul>
+ *   <li><b>顺序正向 + 逆序补偿</b>：按定义顺序执行；某步重试耗尽后，已成功步骤逆序补偿。</li>
+ *   <li><b>幂等不重复生效</b>：动作经 {@link IdempotentActionGuard} 守卫，DONE 即短路；
+ *       超时使用 attempt fencing，迟到的旧回调被丢弃。</li>
+ *   <li><b>并发收敛</b>：每实例一把执行锁，重复/并发提交同一 instanceId 串行收敛到唯一终态。</li>
+ *   <li><b>重启恢复</b>：所有状态落盘；{@link #recoverAll()} 继续未完成实例，
+ *       已确认完成的步骤不重复执行，未完成的补偿不跳过。</li>
+ *   <li><b>可解释</b>：每次输入、状态迁移、判定依据都写轨迹并打日志。</li>
+ * </ul>
+ */
+public class SagaOrchestrator {
+
+    private static final Logger log = LoggerFactory.getLogger(SagaOrchestrator.class);
+
+    private static final String PHASE_FORWARD = "FORWARD";
+    private static final String PHASE_COMPENSATE = "COMPENSATE";
+
+    private final SagaStore store;
+    private final IdempotentActionGuard guard;
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final Map<String, SagaDefinition> definitions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ReentrantLock> executionLocks = new ConcurrentHashMap<>();
+    private final ExecutorService actionExecutors = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "saga-action-" + System.nanoTime());
+        t.setDaemon(true);
+        return t;
+    });
+    private final AtomicLong fenceCounter = new AtomicLong();
+
+    public SagaOrchestrator(SagaStore store) {
+        this.store = store;
+        this.guard = new IdempotentActionGuard(store);
+        log.info("[orchestrator] created with store {}", store.getClass().getSimpleName());
+    }
+
+    // ---------------------------------------------------------------------
+    // 定义注册
+    // ---------------------------------------------------------------------
+
+    /** 注册编排模板；同名模板步骤结构不一致时以 CONFLICTING_DEFINITION 明确拒绝。 */
+    public void register(SagaDefinition definition) {
+        SagaDefinition existing = definitions.get(definition.type());
+        if (existing != null && !signature(existing).equals(signature(definition))) {
+            throw new SagaRejectedException(RejectReason.CONFLICTING_DEFINITION,
+                    "saga type '" + definition.type() + "' already registered with steps "
+                            + signature(existing) + ", cannot re-register with " + signature(definition));
+        }
+        definitions.put(definition.type(), definition);
+        log.info("[orchestrator] registered saga type='{}' steps={}", definition.type(), signature(definition));
+    }
+
+    private static List<String> signature(SagaDefinition d) {
+        return d.steps().stream().map(StepDefinition::name).toList();
+    }
+
+    // ---------------------------------------------------------------------
+    // 提交（幂等 + 并发收敛）
+    // ---------------------------------------------------------------------
+
+    public SubmitResult submit(String type, String instanceId, String businessId, Map<String, Object> input) {
+        SagaDefinition def = definitions.get(type);
+        if (def == null) {
+            throw new SagaRejectedException(RejectReason.ILLEGAL_STATE,
+                    "unknown saga type '" + type + "', register a definition first");
+        }
+        Map<String, Object> safeInput = input == null ? Map.of() : new LinkedHashMap<>(input);
+        log.info("[submit] input: type={} instanceId={} businessId={} input={}",
+                type, instanceId, businessId, safeInput);
+
+        SagaInstance candidate = newInstance(type, instanceId, businessId, safeInput, def);
+        var existing = store.createIfAbsent(candidate);
+        boolean duplicated = existing.isPresent();
+        if (duplicated && !type.equals(existing.get().getType())) {
+            throw new SagaRejectedException(RejectReason.CONFLICTING_DEFINITION,
+                    "instance " + instanceId + " already exists with type '" + existing.get().getType()
+                            + "' but submitted as '" + type + "'");
+        }
+
+        ReentrantLock lock = executionLocks.computeIfAbsent(instanceId, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            SagaInstance fresh = require(instanceId);
+            if (duplicated) {
+                trace(fresh, TraceType.SUBMIT_DEDUP, null,
+                        "duplicate/concurrent submit converged to existing instance in status " + fresh.getStatus());
+                persist(fresh);
+            }
+            resume(fresh, def);
+            SagaSnapshot snapshot = toSnapshot(require(instanceId));
+            log.info("[submit] decision: instanceId={} deduplicated={} finalStatus={}",
+                    instanceId, duplicated, snapshot.status());
+            return new SubmitResult(snapshot, duplicated);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private SagaInstance newInstance(String type, String instanceId, String businessId,
+                                     Map<String, Object> input, SagaDefinition def) {
+        long now = System.currentTimeMillis();
+        SagaInstance inst = new SagaInstance();
+        inst.setInstanceId(instanceId);
+        inst.setType(type);
+        inst.setBusinessId(businessId);
+        inst.setInput(input);
+        inst.setCreatedMillis(now);
+        inst.setUpdatedMillis(now);
+        List<StepExecution> steps = new ArrayList<>();
+        for (int i = 0; i < def.steps().size(); i++) {
+            StepExecution se = new StepExecution();
+            se.setName(def.steps().get(i).name());
+            se.setIndex(i);
+            se.setUpdatedMillis(now);
+            steps.add(se);
+        }
+        inst.setSteps(steps);
+        trace(inst, TraceType.SUBMITTED, null, "instance accepted with input " + input);
+        return inst;
+    }
+
+    // ---------------------------------------------------------------------
+    // 恢复 / 状态机驱动
+    // ---------------------------------------------------------------------
+
+    /** 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。 */
+    public int recoverAll() {
+        List<SagaInstance> all = store.findAll();
+        int recovered = 0;
+        for (SagaInstance inst : all) {
+            SagaStatus status = inst.getStatus();
+            boolean unfinished = status == SagaStatus.PENDING || status == SagaStatus.RUNNING
+                    || status == SagaStatus.COMPENSATING
+                    || status == SagaStatus.COMPENSATION_FAILED;
+            if (!unfinished) {
+                continue;
+            }
+            ReentrantLock lock = executionLocks.computeIfAbsent(inst.getInstanceId(), k -> new ReentrantLock());
+            lock.lock();
+            try {
+                SagaDefinition resolved = definitions.get(inst.getType());
+                if (resolved == null) {
+                    log.warn("[recover] instance={} type='{}' has no registered definition in this process; "
+                            + "skip recovery (register the definition then call recoverAll again)",
+                            inst.getInstanceId(), inst.getType());
+                    continue;
+                }
+                SagaInstance fresh = require(inst.getInstanceId());
+                trace(fresh, TraceType.RECOVERED, null,
+                        "resume after (re)initialisation from status " + fresh.getStatus()
+                                + "; already-confirmed steps will not be re-executed");
+                persist(fresh);
+                log.info("[recover] resuming instance={} from status={}", fresh.getInstanceId(), fresh.getStatus());
+                resume(fresh, resolved);
+                recovered++;
+            } finally {
+                lock.unlock();
+            }
+        }
+        log.info("[recover] scanned {} instances, resumed {}", all.size(), recovered);
+        return recovered;
+    }
+
+    /** 根据当前状态选择推进路径；终态直接收敛返回。 */
+    private void resume(SagaInstance inst, SagaDefinition def) {
+        if (def == null) {
+            throw new SagaRejectedException(RejectReason.ILLEGAL_STATE,
+                    "no definition registered for type '" + inst.getType()
+                            + "'; register it before resuming/recovering");
+        }
+        switch (inst.getStatus()) {
+            case PENDING, RUNNING -> runForward(inst, def);
+            case COMPENSATING, COMPENSATION_FAILED -> runCompensation(inst, def);
+            case COMPLETED, COMPENSATED, FAILED -> log.info(
+                    "[resume] instance={} already in terminal status {} -> converge",
+                    inst.getInstanceId(), inst.getStatus());
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 正向执行
+    // ---------------------------------------------------------------------
+
+    private void runForward(SagaInstance inst, SagaDefinition def) {
+        if (inst.getStatus() == com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus.PENDING) {
+            transition(inst, com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus.RUNNING,
+                    "start forward execution");
+        }
+        for (int i = 0; i < def.steps().size(); i++) {
+            StepDefinition step = def.steps().get(i);
+            StepExecution se = inst.getSteps().get(i);
+            if (se.getStatus() == com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.SUCCEEDED) {
+                log.info("[forward] instance={} step={} already SUCCEEDED -> skip (no duplicate execution)",
+                        inst.getInstanceId(), step.name());
+                continue;
+            }
+            if (se.getStatus() == com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.SKIPPED) {
+                continue;
+            }
+            boolean ok = executeStepWithRetries(inst, def, step, se, PHASE_FORWARD);
+            if (!ok) {
+                for (int j = i + 1; j < def.steps().size(); j++) {
+                    StepExecution later = inst.getSteps().get(j);
+                    if (later.getStatus() == com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.PENDING) {
+                        later.setStatus(com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.SKIPPED);
+                        later.setUpdatedMillis(System.currentTimeMillis());
+                        trace(inst, TraceType.STEP_SKIPPED, later.getName(),
+                                "skipped because earlier step '" + step.name() + "' failed");
+                    }
+                }
+                persist(inst);
+                runCompensation(inst, def);
+                return;
+            }
+        }
+        transition(inst, com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus.COMPLETED,
+                "all " + def.steps().size() + " steps succeeded");
+    }
+
+    // ---------------------------------------------------------------------
+    // 逆序补偿
+    // ---------------------------------------------------------------------
+
+    public SagaSnapshot triggerCompensation(String instanceId) {
+        ReentrantLock lock = executionLocks.computeIfAbsent(instanceId, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            SagaInstance inst = require(instanceId);
+            SagaDefinition def = definitions.get(inst.getType());
+            log.info("[compensate] manual trigger instance={} currentStatus={}", instanceId, inst.getStatus());
+            switch (inst.getStatus()) {
+                case COMPENSATION_FAILED, COMPENSATING -> runCompensation(inst, def);
+                case COMPENSATED -> log.info("[compensate] instance={} already COMPENSATED -> idempotent no-op",
+                        instanceId);
+                default -> throw new SagaRejectedException(RejectReason.ILLEGAL_STATE,
+                        "cannot trigger compensation for instance " + instanceId
+                                + " in status " + inst.getStatus());
+            }
+            return toSnapshot(require(instanceId));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void runCompensation(SagaInstance inst, SagaDefinition def) {
+        if (inst.getStatus() != com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus.COMPENSATING) {
+            transition(inst, com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus.COMPENSATING,
+                    "begin reverse compensation");
+        }
+        boolean anyFailed = false;
+        for (int i = def.steps().size() - 1; i >= 0; i--) {
+            StepDefinition step = def.steps().get(i);
+            StepExecution se = inst.getSteps().get(i);
+            switch (se.getStatus()) {
+                case COMPENSATED -> log.info("[compensate] step={} already COMPENSATED -> idempotent skip",
+                        step.name());
+                case PENDING, SKIPPED -> {
+                    se.setStatus(com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.SKIPPED);
+                    se.setUpdatedMillis(System.currentTimeMillis());
+                    trace(inst, TraceType.STEP_COMPENSATED, step.name(),
+                            "never confirmed success, nothing to compensate -> skipped");
+                    persist(inst);
+                }
+                case FAILED -> trace(inst, TraceType.STEP_COMPENSATED, step.name(),
+                        "failed step has no confirmed effect -> not compensated");
+                default -> {
+                    if (step.compensation() == null) {
+                        se.setStatus(com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.COMPENSATED);
+                        se.setUpdatedMillis(System.currentTimeMillis());
+                        trace(inst, TraceType.STEP_COMPENSATED, step.name(),
+                                "no compensation registered, treated as compensated");
+                        persist(inst);
+                        break;
+                    }
+                    boolean ok = executeStepWithRetries(inst, def, step, se, PHASE_COMPENSATE);
+                    if (!ok) {
+                        anyFailed = true;
+                    }
+                }
+            }
+        }
+        if (anyFailed) {
+            transition(inst, com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus.COMPENSATION_FAILED,
+                    "at least one compensation failed; intermediate state retained, re-trigger compensation to retry");
+        } else {
+            transition(inst, com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus.COMPENSATED,
+                    "reverse compensation finished for all confirmed steps");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 单步执行（正向/补偿共用）：守卫 + 超时 + 确定重试
+    // ---------------------------------------------------------------------
+
+    private boolean executeStepWithRetries(SagaInstance inst, SagaDefinition def, StepDefinition step,
+                                           StepExecution se, String phase) {
+        boolean compensate = PHASE_COMPENSATE.equals(phase);
+        int maxAttempts = step.maxAttempts();
+        while (true) {
+            int attempt = (compensate ? se.getCompensationAttempts() : se.getAttempts()) + 1;
+            String gk = IdempotentActionGuard.key(inst.getInstanceId(), step.name(), phase);
+            IdempotentActionGuard.BeginResult br = guard.begin(gk, attempt);
+            if (br.outcome() == IdempotentActionGuard.Outcome.ALREADY_DONE) {
+                Object reused = deserialize(br.resultJson());
+                log.info("[{}] instance={} step={} guard DONE(attempt={}) -> reuse result, skip action",
+                        phase, inst.getInstanceId(), step.name(), br.previousAttempt());
+                finishStepSuccess(inst, se, compensate, reused, attempt,
+                        "idempotent reuse: side effect already confirmed at attempt " + br.previousAttempt(),
+                        compensate ? TraceType.STEP_COMPENSATED : TraceType.STEP_SUCCEEDED);
+                return true;
+            }
+
+            se.setStatus(compensate
+                    ? com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.COMPENSATING
+                    : com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.RUNNING);
+            trace(inst, compensate
+                            ? (attempt == 1 ? TraceType.STEP_COMPENSATE_START : TraceType.STEP_COMPENSATE_RETRY)
+                            : (attempt == 1 ? TraceType.STEP_START : TraceType.STEP_RETRY),
+                    step.name(), "attempt " + attempt + "/" + maxAttempts
+                            + " (guard previous=" + br.previousState() + ") timeout=" + step.timeoutMillis() + "ms");
+            persist(inst);
+
+            ActionContext ctx = buildContext(inst, def, step, attempt);
+            AttemptRecord rec = new AttemptRecord();
+            rec.setAttempt(attempt);
+            rec.setPhase(phase);
+            rec.setStartMillis(System.currentTimeMillis());
+
+            Object result = null;
+            String error = null;
+            boolean timedOut = false;
+
+            Future<?> future = compensate
+                    ? actionExecutors.submit(() -> {
+                        step.compensation().compensate(ctx);
+                        return null;
+                    })
+                    : actionExecutors.submit(() -> step.action().execute(ctx));
+            try {
+                result = step.timeoutMillis() > 0
+                        ? future.get(step.timeoutMillis(), TimeUnit.MILLISECONDS)
+                        : future.get();
+                guard.complete(gk, attempt, result == null ? null : serialize(result));
+                rec.setStatus("SUCCESS");
+            } catch (TimeoutException e) {
+                timedOut = true;
+                future.cancel(true);
+                error = "timeout after " + step.timeoutMillis() + "ms";
+                rec.setStatus("TIMEOUT");
+                // 不调用 guard.fail：保留 IN_FLIGHT + attempt fencing，迟到结果将被丢弃
+            } catch (ExecutionException e) {
+                error = rootMessage(e);
+                guard.fail(gk, attempt, error);
+                rec.setStatus("FAILURE");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                error = "interrupted";
+                guard.fail(gk, attempt, error);
+                rec.setStatus("FAILURE");
+            } finally {
+                rec.setEndMillis(System.currentTimeMillis());
+            }
+            rec.setError(error);
+            se.getRecords().add(rec);
+
+            if (!timedOut && error == null) {
+                finishStepSuccess(inst, se, compensate, result, attempt,
+                        "attempt " + attempt + " succeeded",
+                        compensate ? TraceType.STEP_COMPENSATED : TraceType.STEP_SUCCEEDED);
+                return true;
+            }
+
+            if (compensate) {
+                se.setCompensationAttempts(attempt);
+            } else {
+                se.setAttempts(attempt);
+            }
+            se.setLastError(error);
+            se.setUpdatedMillis(System.currentTimeMillis());
+            trace(inst, compensate ? TraceType.STEP_COMPENSATE_FAILED : TraceType.STEP_FAILED, step.name(),
+                    "attempt " + attempt + " " + (timedOut ? "timed out" : "failed") + ": " + error
+                            + (RetryPolicy.hasNextAttempt(attempt, maxAttempts)
+                            ? " -> will retry per deterministic policy"
+                            : " -> max attempts exhausted"));
+            persist(inst);
+
+            if (!RetryPolicy.hasNextAttempt(attempt, maxAttempts)) {
+                se.setStatus(compensate
+                        ? com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.COMPENSATION_FAILED
+                        : com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.FAILED);
+                se.setUpdatedMillis(System.currentTimeMillis());
+                persist(inst);
+                return false;
+            }
+            try {
+                RetryPolicy.backoff(step.retryBackoffMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void finishStepSuccess(SagaInstance inst, StepExecution se, boolean compensate, Object result,
+                                   int attempt, String detail, TraceType traceType) {
+        if (compensate) {
+            se.setCompensationAttempts(Math.max(se.getCompensationAttempts(), attempt));
+            se.setStatus(com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.COMPENSATED);
+        } else {
+            se.setAttempts(Math.max(se.getAttempts(), attempt));
+            se.setStatus(com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.SUCCEEDED);
+            se.setResult(result);
+        }
+        se.setLastError(null);
+        se.setUpdatedMillis(System.currentTimeMillis());
+        trace(inst, traceType, se.getName(), detail);
+        persist(inst);
+    }
+
+    private ActionContext buildContext(SagaInstance inst, SagaDefinition def, StepDefinition current, int attempt) {
+        Map<String, Object> results = new LinkedHashMap<>();
+        for (StepExecution se : inst.getSteps()) {
+            if (se.getStatus() == com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.SUCCEEDED) {
+                results.put(se.getName(), se.getResult());
+            }
+        }
+        return new ActionContext(inst.getInstanceId(), current.name(), attempt,
+                inst.getBusinessId(), inst.getInput(), results);
+    }
+
+    // ---------------------------------------------------------------------
+    // 查询
+    // ---------------------------------------------------------------------
+
+    public SagaSnapshot snapshot(String instanceId) {
+        return toSnapshot(require(instanceId));
+    }
+
+    public List<SagaSnapshot> list() {
+        return store.findAll().stream().map(this::toSnapshot).toList();
+    }
+
+    private SagaSnapshot toSnapshot(SagaInstance inst) {
+        List<SagaSnapshot.StepView> views = inst.getSteps().stream()
+                .map(se -> new SagaSnapshot.StepView(se.getName(), se.getIndex(), se.getStatus(),
+                        se.getAttempts(), se.getCompensationAttempts(), se.getLastError(), se.getResult(),
+                        List.copyOf(se.getRecords())))
+                .toList();
+        return new SagaSnapshot(inst.getInstanceId(), inst.getType(), inst.getBusinessId(),
+                inst.getStatus(), inst.getVersion(), views, List.copyOf(inst.getTraces()),
+                inst.getUpdatedMillis());
+    }
+
+    // ---------------------------------------------------------------------
+    // 内部辅助
+    // ---------------------------------------------------------------------
+
+    private SagaInstance require(String instanceId) {
+        return store.find(instanceId)
+                .orElseThrow(() -> new SagaRejectedException(RejectReason.UNKNOWN_INSTANCE,
+                        "saga instance '" + instanceId + "' does not exist"));
+    }
+
+    private void persist(SagaInstance inst) {
+        inst.setUpdatedMillis(System.currentTimeMillis());
+        store.update(inst, inst.getVersion());
+    }
+
+    private void transition(SagaInstance inst,
+                            com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus target,
+                            String reason) {
+        log.info("[transition] instance={} {} -> {} | reason: {}",
+                inst.getInstanceId(), inst.getStatus(), target, reason);
+        inst.setStatus(target);
+        TraceEvent ev = new TraceEvent();
+        ev.setMillis(System.currentTimeMillis());
+        ev.setType(switch (target) {
+            case RUNNING -> TraceType.FORWARD_START;
+            case COMPLETED -> TraceType.COMPLETED;
+            case COMPENSATING -> TraceType.COMPENSATION_START;
+            case COMPENSATION_FAILED -> TraceType.COMPENSATION_FAILED;
+            case COMPENSATED -> TraceType.COMPENSATED_ALL;
+            default -> TraceType.REJECTED;
+        });
+        ev.setDetail(inst.getStatus() + " : " + reason);
+        inst.getTraces().add(ev);
+        persist(inst);
+    }
+
+    private void trace(SagaInstance inst, TraceType type, String stepName, String detail) {
+        TraceEvent ev = new TraceEvent();
+        ev.setMillis(System.currentTimeMillis());
+        ev.setType(type);
+        ev.setStepName(stepName);
+        ev.setDetail(detail);
+        inst.getTraces().add(ev);
+        log.info("[trace] instance={} step={} event={} | {}", inst.getInstanceId(), stepName, type, detail);
+    }
+
+    private String serialize(Object value) {
+        try {
+            return mapper.writeValueAsString(value);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Object deserialize(String json) {
+        if (json == null) {
+            return null;
+        }
+        try {
+            return mapper.readValue(json, Object.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String rootMessage(Throwable t) {
+        Throwable cur = t;
+        while (cur.getCause() != null && cur.getCause() != cur) {
+            cur = cur.getCause();
+        }
+        return cur.getClass().getSimpleName() + ": " + cur.getMessage();
+    }
+
+}
