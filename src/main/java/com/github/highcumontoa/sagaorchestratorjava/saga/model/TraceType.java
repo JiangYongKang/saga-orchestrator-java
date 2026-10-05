@@ -20,5 +20,6 @@ public enum TraceType {
     COMPLETED,
     COMPENSATED_ALL,
     RECOVERED,
+    IN_FLIGHT_RECOVERED,
     REJECTED
 }

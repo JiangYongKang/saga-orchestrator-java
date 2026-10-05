@@ -1,7 +1,8 @@
 # Saga Orchestrator（本地可验证的分布式事务编排组件）
 
 一个**不依赖任何外部中间件**的 Saga 编排组件：用本地文件存储替代数据库 / 消息队列，
-在单机、单测内即可验证「正向执行、失败补偿、重复触发、并发提交、重启恢复」等分布式事务场景，
+在单机、单测内即可验证「正向执行、失败补偿、重复触发、并发提交、重启恢复、
+在途崩溃恢复（动作已下发、确认未落盘时进程被杀）」等分布式事务场景，
 并对每次输入、状态迁移与判定依据给出可解释的状态与轨迹。
 
 技术栈沿用工程现状：**Java 21 + Spring Boot 3.4 + Spring Web + JUnit 5 + Maven**。
@@ -11,11 +12,14 @@
 ## 1. 快速开始
 
 ```bash
-# 运行全部测试（14 个，含单元、持久化、Spring 集成测试），无需任何外部服务
+# 运行全部测试（20 个，含单元、持久化、崩溃恢复、Spring 集成测试），无需任何外部服务
 mvn test
 
 # 只跑编排器核心用例（可看到完整的输入/迁移/判定日志）
 mvn test -Dtest=SagaOrchestratorTest
+
+# 只跑在途崩溃恢复用例（动作已下发、确认未落盘时进程被杀）
+mvn test -Dtest=SagaCrashRecoveryTest
 ```
 
 默认持久化目录为 `target/saga-store/`（可用配置项覆盖，见第 7 节），
@@ -122,7 +126,38 @@ orch.recoverAll();           // 重启/重新初始化后恢复未完成实例
 > 因此业务动作本身仍应**按业务键保证幂等**；守卫保证“已确认的结果绝不重复调用”，
 > 令牌保证“迟到的旧结果绝不覆盖新状态”。
 
-### 5.2 重试与超时
+### 5.2 稳定动作去重标识（action key）
+
+每个正向动作与补偿动作都有一个**稳定去重标识**，通过 `ActionContext.actionKey()` 交给业务实现，
+派生规则公开在 `saga.model.ActionKeys`：
+
+```
+saga:<type>:<instanceId>:<stepName>:<FORWARD|COMPENSATE>
+```
+
+- **稳定**：标识完全由已持久化的字段确定性派生，同一逻辑动作无论重试多少次、
+  重启多少次、被重复触发多少次，标识都不变；
+- **不撞车**：不同实例 / 不同步骤 / 同一步骤的正向与补偿，标识两两不同；
+- **业务判重抓手**：编排器无法替业务判定「崩溃前副作用到底有没有落地」，
+  因此结果未知的动作会被**以同一个 actionKey 重放**；业务方以该 key 做判重
+  （例如以它为唯一键写去重表 / 账本），即可自己挡掉重复生效：
+
+```java
+new StepDefinition("debit", ctx -> {
+    String key = ctx.actionKey();          // 跨重试/跨重启不变
+    if (ledger.exists(key)) return ledger.resultOf(key); // 已生效过：直接返回原结果
+    ledger.apply(key, doDebit(ctx.businessId()));        // 首次：真正生效并记录
+    return ledger.resultOf(key);
+}, ...);
+```
+
+- **兼容范围**：标识是**现场派生**的，不向磁盘写入任何新字段，因此功能上线前
+  已落盘的老实例**无需迁移**——恢复时按同一规则派生即可（见
+  `SagaCrashRecoveryTest.legacyPersistedInstanceFromBeforeThisFeatureStillRecovers`）。
+  唯一前提：老实例的 `type / instanceId / stepName` 不变（同名定义重复注册本就被
+  `CONFLICTING_DEFINITION` 约束）。
+
+### 5.3 重试与超时
 
 - 是否还有下一次尝试仅由 `usedAttempts < maxAttempts` 决定，退避为固定时长（无随机抖动），结论确定可复现。
 - 超时（`TimeoutException`）与业务异常分别记录为 `TIMEOUT` / `FAILURE`，在步骤的 `records` 中可区分。
@@ -154,7 +189,33 @@ orch.recoverAll();           // 重启/重新初始化后恢复未完成实例
   - `SUCCEEDED` 步骤跳过、`COMPENSATED` 补偿跳过 —— 不重复执行已确认工作；
   - `COMPENSATION_FAILED` 的补偿会被再次尝试 —— 不跳过错过的补偿；
   - 守卫记录随磁盘恢复，`DONE` 仍然短路。
-- 若某类型在当前进程未注册定义，则跳过并告警；注册定义后再次调用 `recoverAll()` 即可。
+- 若某类型在当前进程未注册定义，则跳过并告警，同时把该类型记入「待补定义」集合；
+  **定义随后注册时会自动补恢复**——无论自动恢复与业务定义加载谁先谁后，
+  都不会漏掉任何应继续推进的实例（注册后再次手动 `recoverAll()` 也依然幂等）。
+
+### 7.1 在途崩溃恢复（动作已下发、结果未确认）
+
+最危险的崩溃窗口是：业务动作已经下发、守卫记录已落盘为 `IN_FLIGHT`，
+但动作结果（成功/失败）还没来得及确认落盘，进程就被杀了。规则如下：
+
+1. **识别**：恢复（`recoverAll` / 定义补齐后的自动补恢复 / 重复提交触发的 `resume`）
+   在进入状态机前，若发现某步停留在 `RUNNING`/`COMPENSATING` 且对应守卫记录为
+   `IN_FLIGHT`，即判定为「在途崩溃」——此时本进程没有任何线程在执行该实例
+   （实例锁保证），该尝试一定是上一进程生命的孤儿。
+2. **处置**：写一条 `IN_FLIGHT_RECOVERED` 轨迹说明判定依据，然后**以同一个
+   稳定 actionKey 重放该逻辑动作**。结果未知意味着副作用可能已落地也可能没有，
+   编排器不能假装它成功（会丢补偿），也不能假装它失败（会丢确认），唯一安全的
+   收敛方式就是重放 + 业务按键判重。
+3. **收敛保证**：
+   - 真正生效过的业务操作不会第二次生效——业务用 `actionKey` 认出重放并短路；
+   - 没做完的补偿不会因为这次重启被跳过——`COMPENSATING` 中的补偿同样按上述规则重放；
+   - 恢复幂等——`recoverAll()` 在实例锁内重读状态，已被并发恢复推进到终态的实例
+     直接收敛（不计数、不追加矛盾轨迹）；自动恢复后再手动恢复、多个恢复并发跑，
+     副作用都不会增多，轨迹中只出现一次恢复结论。
+4. **可解释**：快照的每个步骤视图带 `actionKey` / `compensationKey` / `inFlight` /
+   `inFlightAttempt` 字段。`inFlight=true` 即「动作已下发、结果还没确定」的在途
+   中间态（崩溃遗留或正在执行都可据此识别）；恢复完成后该标记清零，
+   不会出现「步骤 RUNNING 但实例已终态」这类矛盾结论。
 
 配置项（`application.properties`）：
 
@@ -168,9 +229,10 @@ saga.recover-on-startup=true       # 启动是否自动恢复
 ## 8. 可解释查询
 
 `SagaSnapshot` 包含：实例状态、版本、每步状态 / 尝试次数 / 补偿次数 / 最近错误 / 步骤结果 /
+稳定去重标识（`actionKey` / `compensationKey`）/ 在途标记（`inFlight` / `inFlightAttempt`）/
 每次尝试记录（`AttemptRecord`：阶段、序号、SUCCESS/FAILURE/TIMEOUT、错误、起止时间），
 以及按时间排列的完整 `TraceEvent` 轨迹（提交、去重、开始、重试、超时、成功、失败、
-补偿开始 / 重试 / 成功 / 失败、整体完成 / 补偿完成、恢复、拒绝）。
+补偿开始 / 重试 / 成功 / 失败、整体完成 / 补偿完成、恢复、在途崩溃处置、拒绝）。
 
 HTTP 接口（`SagaController`）：
 
@@ -197,8 +259,29 @@ HTTP 接口（`SagaController`）：
 | 超时计入尝试、重试成功、TIMEOUT/FAILURE 可区分 | `SagaOrchestratorTest.timeoutIsRetriedAndEffectivelyCompletesOnce` |
 | 重新初始化后恢复：不重复已确认工作、不跳过补偿 | `SagaOrchestratorTest.recoversAcrossReinitialisationWithoutRepeatingConfirmedWork` |
 | 五类拒绝原因可区分 | `SagaOrchestratorTest.rejectsWithDistinguishableReasons` |
+| 正向动作在途崩溃：重放不重复生效、收敛唯一终态、快照/轨迹可解释 | `SagaCrashRecoveryTest.forwardActionCrashMidFlightRecoversWithoutDoubleEffect` |
+| 补偿动作在途崩溃：补偿既不跳过也不重复生效 | `SagaCrashRecoveryTest.compensationCrashMidFlightIsNeitherSkippedNorDoubled` |
+| 恢复扫描先于定义注册：定义补齐后自动补恢复，不漏实例 | `SagaCrashRecoveryTest.recoveryScanBeforeDefinitionRegistrationStillRecovers` |
+| 并发 + 重复恢复幂等：副作用不增多、结论不矛盾 | `SagaCrashRecoveryTest.concurrentAndRepeatedRecoveryStaysIdempotent` |
+| 稳定去重标识：跨重试不变、不同动作互不撞车 | `SagaCrashRecoveryTest.actionKeyIsStableAcrossRetriesAndUniquePerAction` |
+| 老格式落盘实例免迁移恢复 | `SagaCrashRecoveryTest.legacyPersistedInstanceFromBeforeThisFeatureStillRecovers` |
 | 创建去重、版本冲突、磁盘扫描恢复 | `FileSagaStoreTest` |
 | Spring 装配、HTTP 提交/查询/补偿、拒绝码、端到端补偿 | `SagaIntegrationTest` |
 
 测试日志会打印每次输入（`[input]`/`[submit]`）、状态迁移（`[transition]`）、
 守卫判定（`[guard] ... previous=...`）与断言依据（`判定依据：...`）。
+
+### 9.1 本地复现在途崩溃
+
+`SagaCrashRecoveryTest` 用纯本地手段复现「动作已下发、确认未落盘时进程被杀」：
+
+1. 第一个编排器的业务动作在副作用生效后**永久阻塞**（确认永远来不及落盘），
+   随后丢弃该编排器——等价于进程被杀；此时磁盘上留有 `RUNNING` 步骤 +
+   `IN_FLIGHT` 守卫记录，可用 `snapshot()` 直接观察到 `inFlight=true` 的在途中间态；
+2. 同一持久化目录新建编排器（= 重启），`recoverAll()` 识别在途崩溃、
+   写 `IN_FLIGHT_RECOVERED` 轨迹、以同一 actionKey 重放；
+3. 业务侧用 `BusinessLedger`（以 actionKey 为键的去重账本）挡掉重复生效，
+   断言副作用恰好一次、终态唯一、轨迹无矛盾。
+
+运行 `mvn test -Dtest=SagaCrashRecoveryTest` 即可在日志中完整看到
+输入、状态迁移与每一步判定依据。

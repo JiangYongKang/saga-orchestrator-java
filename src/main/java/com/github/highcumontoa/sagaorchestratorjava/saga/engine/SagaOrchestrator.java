@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.highcumontoa.sagaorchestratorjava.saga.exception.RejectReason;
 import com.github.highcumontoa.sagaorchestratorjava.saga.exception.SagaRejectedException;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.ActionContext;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.ActionKeys;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.AttemptRecord;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaDefinition;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaInstance;
@@ -11,10 +12,12 @@ import com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaStatus;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.SagaSnapshot;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.StepDefinition;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.StepExecution;
+import com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.SubmitResult;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.TraceEvent;
 import com.github.highcumontoa.sagaorchestratorjava.saga.model.TraceType;
 import com.github.highcumontoa.sagaorchestratorjava.saga.store.IdempotentActionGuard;
+import com.github.highcumontoa.sagaorchestratorjava.saga.store.GuardRecord;
 import com.github.highcumontoa.sagaorchestratorjava.saga.store.SagaStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,6 +26,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -58,6 +62,8 @@ public class SagaOrchestrator {
     private final IdempotentActionGuard guard;
     private final ObjectMapper mapper = new ObjectMapper();
     private final Map<String, SagaDefinition> definitions = new ConcurrentHashMap<>();
+    /** recoverAll 时发现「有未完成实例但定义尚未注册」的类型；定义补齐后自动补恢复，保证不漏。 */
+    private final java.util.Set<String> typesAwaitingDefinition = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<String, ReentrantLock> executionLocks = new ConcurrentHashMap<>();
     private final ExecutorService actionExecutors = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "saga-action-" + System.nanoTime());
@@ -86,6 +92,11 @@ public class SagaOrchestrator {
         }
         definitions.put(definition.type(), definition);
         log.info("[orchestrator] registered saga type='{}' steps={}", definition.type(), signature(definition));
+        if (typesAwaitingDefinition.remove(definition.type())) {
+            log.info("[orchestrator] definition for type='{}' arrived after recovery scan; "
+                    + "running deferred recovery so no unfinished instance is missed", definition.type());
+            recoverType(definition.type());
+        }
     }
 
     private static List<String> signature(SagaDefinition d) {
@@ -161,42 +172,73 @@ public class SagaOrchestrator {
     // 恢复 / 状态机驱动
     // ---------------------------------------------------------------------
 
-    /** 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。 */
+    /** 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。幂等：可重复、可并发调用。 */
     public int recoverAll() {
         List<SagaInstance> all = store.findAll();
         int recovered = 0;
         for (SagaInstance inst : all) {
-            SagaStatus status = inst.getStatus();
-            boolean unfinished = status == SagaStatus.PENDING || status == SagaStatus.RUNNING
-                    || status == SagaStatus.COMPENSATING
-                    || status == SagaStatus.COMPENSATION_FAILED;
-            if (!unfinished) {
-                continue;
-            }
-            ReentrantLock lock = executionLocks.computeIfAbsent(inst.getInstanceId(), k -> new ReentrantLock());
-            lock.lock();
-            try {
-                SagaDefinition resolved = definitions.get(inst.getType());
-                if (resolved == null) {
-                    log.warn("[recover] instance={} type='{}' has no registered definition in this process; "
-                            + "skip recovery (register the definition then call recoverAll again)",
-                            inst.getInstanceId(), inst.getType());
-                    continue;
-                }
-                SagaInstance fresh = require(inst.getInstanceId());
-                trace(fresh, TraceType.RECOVERED, null,
-                        "resume after (re)initialisation from status " + fresh.getStatus()
-                                + "; already-confirmed steps will not be re-executed");
-                persist(fresh);
-                log.info("[recover] resuming instance={} from status={}", fresh.getInstanceId(), fresh.getStatus());
-                resume(fresh, resolved);
+            if (recoverInstance(inst)) {
                 recovered++;
-            } finally {
-                lock.unlock();
             }
         }
         log.info("[recover] scanned {} instances, resumed {}", all.size(), recovered);
         return recovered;
+    }
+
+    /** 只恢复某个类型的未完成实例（定义晚于恢复扫描注册时的补恢复）。 */
+    private void recoverType(String type) {
+        for (SagaInstance inst : store.findAll()) {
+            if (type.equals(inst.getType())) {
+                recoverInstance(inst);
+            }
+        }
+    }
+
+    /**
+     * 恢复单个实例；返回 true 表示本次调用确实推进了它。
+     * 在实例锁内重读状态：已被并发恢复推进到终态的实例直接收敛，不重复计数、不追加矛盾轨迹。
+     */
+    private boolean recoverInstance(SagaInstance scanned) {
+        SagaStatus status = scanned.getStatus();
+        boolean unfinished = status == SagaStatus.PENDING || status == SagaStatus.RUNNING
+                || status == SagaStatus.COMPENSATING
+                || status == SagaStatus.COMPENSATION_FAILED;
+        if (!unfinished) {
+            return false;
+        }
+        ReentrantLock lock = executionLocks.computeIfAbsent(scanned.getInstanceId(), k -> new ReentrantLock());
+        lock.lock();
+        try {
+            SagaInstance fresh = require(scanned.getInstanceId());
+            if (isTerminal(fresh.getStatus())) {
+                log.info("[recover] instance={} already converged to terminal {} by a concurrent recovery "
+                        + "-> idempotent no-op", fresh.getInstanceId(), fresh.getStatus());
+                return false;
+            }
+            SagaDefinition resolved = definitions.get(fresh.getType());
+            if (resolved == null) {
+                typesAwaitingDefinition.add(fresh.getType());
+                log.warn("[recover] instance={} type='{}' has no registered definition in this process; "
+                        + "deferring recovery — it will resume automatically once the definition is registered "
+                        + "(or call recoverAll again after registering)",
+                        fresh.getInstanceId(), fresh.getType());
+                return false;
+            }
+            trace(fresh, TraceType.RECOVERED, null,
+                    "resume after (re)initialisation from status " + fresh.getStatus()
+                            + "; already-confirmed steps will not be re-executed");
+            persist(fresh);
+            log.info("[recover] resuming instance={} from status={}", fresh.getInstanceId(), fresh.getStatus());
+            resume(fresh, resolved);
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static boolean isTerminal(SagaStatus status) {
+        return status == SagaStatus.COMPLETED || status == SagaStatus.COMPENSATED
+                || status == SagaStatus.FAILED;
     }
 
     /** 根据当前状态选择推进路径；终态直接收敛返回。 */
@@ -206,12 +248,57 @@ public class SagaOrchestrator {
                     "no definition registered for type '" + inst.getType()
                             + "'; register it before resuming/recovering");
         }
+        explainOrphanedInFlight(inst);
         switch (inst.getStatus()) {
             case PENDING, RUNNING -> runForward(inst, def);
             case COMPENSATING, COMPENSATION_FAILED -> runCompensation(inst, def);
             case COMPLETED, COMPENSATED, FAILED -> log.info(
                     "[resume] instance={} already in terminal status {} -> converge",
                     inst.getInstanceId(), inst.getStatus());
+        }
+    }
+
+    /**
+     * 在进入状态机之前识别「动作已下发、结果未确认」的在途步骤（崩溃/被杀遗留）。
+     *
+     * <p>resume 只在持有实例锁、且本进程没有任何线程正在执行该实例时被调用，
+     * 因此这里看到的 RUNNING/COMPENSATING + 守卫 IN_FLIGHT 一定是上一次进程生命
+     * 里没落盘确认的孤儿尝试。对每个这样的步骤写一条 {@link TraceType#IN_FLIGHT_RECOVERED}
+     * 轨迹，说明处置方式：以同一个稳定 actionKey 重放该逻辑动作，由业务侧按键判重，
+     * 编排器既不重复确认、也不跳过任何补偿。
+     */
+    private void explainOrphanedInFlight(SagaInstance inst) {
+        boolean traced = false;
+        for (StepExecution se : inst.getSteps()) {
+            String phase = switch (se.getStatus()) {
+                case RUNNING -> ActionKeys.PHASE_FORWARD;
+                case COMPENSATING -> ActionKeys.PHASE_COMPENSATE;
+                default -> null;
+            };
+            if (phase == null) {
+                continue;
+            }
+            String gk = IdempotentActionGuard.key(inst.getInstanceId(), se.getName(), phase);
+            Optional<GuardRecord> guard = store.findGuard(gk);
+            if (guard.isEmpty() || !IdempotentActionGuard.IN_FLIGHT.equals(guard.get().getState())) {
+                continue;
+            }
+            GuardRecord g = guard.get();
+            String actionKey = ActionKeys.of(inst.getType(), inst.getInstanceId(), se.getName(), phase);
+            trace(inst, TraceType.IN_FLIGHT_RECOVERED, se.getName(),
+                    "orphaned in-flight " + phase + " attempt " + g.getAttempt()
+                            + " detected at resume: action was dispatched but its outcome was never confirmed "
+                            + "(process died before confirmation was persisted). Decision: replay the SAME "
+                            + "logical action with stable actionKey=" + actionKey
+                            + " — the business side deduplicates by this key, so an effect that already landed "
+                            + "must not be applied twice; nothing is skipped");
+            traced = true;
+            log.info("[recover] instance={} step={} phase={} orphaned in-flight attempt={} actionKey={} "
+                            + "-> replay with same key, business dedupes by key",
+                    inst.getInstanceId(), se.getName(), phase, g.getAttempt(), actionKey);
+        }
+        if (traced) {
+            persist(inst);
         }
     }
 
@@ -358,7 +445,7 @@ public class SagaOrchestrator {
                             + " (guard previous=" + br.previousState() + ") timeout=" + step.timeoutMillis() + "ms");
             persist(inst);
 
-            ActionContext ctx = buildContext(inst, def, step, attempt);
+            ActionContext ctx = buildContext(inst, def, step, attempt, phase);
             AttemptRecord rec = new AttemptRecord();
             rec.setAttempt(attempt);
             rec.setPhase(phase);
@@ -454,7 +541,8 @@ public class SagaOrchestrator {
         persist(inst);
     }
 
-    private ActionContext buildContext(SagaInstance inst, SagaDefinition def, StepDefinition current, int attempt) {
+    private ActionContext buildContext(SagaInstance inst, SagaDefinition def, StepDefinition current,
+                                       int attempt, String phase) {
         Map<String, Object> results = new LinkedHashMap<>();
         for (StepExecution se : inst.getSteps()) {
             if (se.getStatus() == com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.SUCCEEDED) {
@@ -462,7 +550,8 @@ public class SagaOrchestrator {
             }
         }
         return new ActionContext(inst.getInstanceId(), current.name(), attempt,
-                inst.getBusinessId(), inst.getInput(), results);
+                inst.getBusinessId(), inst.getInput(), results,
+                ActionKeys.of(inst.getType(), inst.getInstanceId(), current.name(), phase));
     }
 
     // ---------------------------------------------------------------------
@@ -479,9 +568,22 @@ public class SagaOrchestrator {
 
     private SagaSnapshot toSnapshot(SagaInstance inst) {
         List<SagaSnapshot.StepView> views = inst.getSteps().stream()
-                .map(se -> new SagaSnapshot.StepView(se.getName(), se.getIndex(), se.getStatus(),
-                        se.getAttempts(), se.getCompensationAttempts(), se.getLastError(), se.getResult(),
-                        List.copyOf(se.getRecords())))
+                .map(se -> {
+                    String phase = se.getStatus() == StepStatus.COMPENSATING
+                            ? ActionKeys.PHASE_COMPENSATE : ActionKeys.PHASE_FORWARD;
+                    GuardRecord g = (se.getStatus() == StepStatus.RUNNING
+                            || se.getStatus() == StepStatus.COMPENSATING)
+                            ? store.findGuard(IdempotentActionGuard.key(inst.getInstanceId(), se.getName(), phase))
+                                    .orElse(null)
+                            : null;
+                    boolean inFlight = g != null && IdempotentActionGuard.IN_FLIGHT.equals(g.getState());
+                    return new SagaSnapshot.StepView(se.getName(), se.getIndex(), se.getStatus(),
+                            se.getAttempts(), se.getCompensationAttempts(), se.getLastError(), se.getResult(),
+                            List.copyOf(se.getRecords()),
+                            ActionKeys.forward(inst.getType(), inst.getInstanceId(), se.getName()),
+                            ActionKeys.compensation(inst.getType(), inst.getInstanceId(), se.getName()),
+                            inFlight, inFlight ? g.getAttempt() : 0);
+                })
                 .toList();
         return new SagaSnapshot(inst.getInstanceId(), inst.getType(), inst.getBusinessId(),
                 inst.getStatus(), inst.getVersion(), views, List.copyOf(inst.getTraces()),

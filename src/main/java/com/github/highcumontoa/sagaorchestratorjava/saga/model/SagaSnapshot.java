@@ -24,6 +24,14 @@ public record SagaSnapshot(
             int compensationAttempts,
             String lastError,
             Object result,
-            List<AttemptRecord> records) {
+            List<AttemptRecord> records,
+            /** 正向动作的稳定去重标识（派生规则见 ActionKeys）。 */
+            String actionKey,
+            /** 补偿动作的稳定去重标识。 */
+            String compensationKey,
+            /** true 表示「动作已下发、结果尚未确认」的在途中间态（含崩溃遗留）。 */
+            boolean inFlight,
+            /** 在途动作对应的尝试序号（fencing token）；非在途时为 0。 */
+            int inFlightAttempt) {
     }
 }
