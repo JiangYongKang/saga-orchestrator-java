@@ -329,7 +329,8 @@ class SagaOrchestratorTest {
         SagaSnapshot after = second.snapshot("inst-7");
         log.info("[assert] recovered={} status={} sideEffects={}", recovered, after.status(), sideEffects);
 
-        assertEquals(1, recovered, "判定依据：必须识别并恢复恰好一个未完成实例");
+        assertEquals(0, recovered,
+                "判定依据：注册定义时已自动补恢复该类型的未完成实例，recoverAll 再次扫描为幂等 no-op");
         assertEquals(SagaStatus.COMPENSATED, after.status());
         assertFalse(sideEffects.contains("a-forward-NEW"),
                 "判定依据：恢复不得重新执行已确认成功的正向步骤");

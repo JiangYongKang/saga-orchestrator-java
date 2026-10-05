@@ -11,7 +11,7 @@
 ## 1. 快速开始
 
 ```bash
-# 运行全部测试（14 个，含单元、持久化、Spring 集成测试），无需任何外部服务
+# 运行全部测试（19 个，含单元、持久化、在途崩溃恢复、Spring 集成测试），无需任何外部服务
 mvn test
 
 # 只跑编排器核心用例（可看到完整的输入/迁移/判定日志）
@@ -122,7 +122,26 @@ orch.recoverAll();           // 重启/重新初始化后恢复未完成实例
 > 因此业务动作本身仍应**按业务键保证幂等**；守卫保证“已确认的结果绝不重复调用”，
 > 令牌保证“迟到的旧结果绝不覆盖新状态”。
 
-### 5.2 重试与超时
+### 5.2 稳定去重标识 `dedupKey`（业务侧判重抓手）
+
+每次调用业务动作（正向或补偿）时，`ActionContext.dedupKey()` 都会带上一个**稳定去重标识**：
+
+- 取值与幂等守卫同键：`{instanceId}|{stepName}|{FORWARD|COMPENSATE}`，纯确定性推导；
+- **跨重试、跨重启、跨重复触发保持不变**——同一逻辑动作第 1 次尝试和第 N 次恢复重放，
+  业务方看到的都是同一个键；
+- 不同步骤、同一步骤的正向与补偿、不同实例之间**互不撞车**；
+- 快照中每步的 `forwardDedupKey` / `compensationDedupKey` 可直接查询，便于对账。
+
+业务方用法：把 `dedupKey` 当作自己副作用的幂等键（唯一约束 / 去重表 / putIfAbsent）。
+当「副作用已落地但确认没来得及落盘」（崩溃、超时）时，编排器会用同一个键重放，
+业务侧凭键认出「这是同一次动作的重放」，直接返回之前的结果即可挡掉重复生效。
+
+**兼容范围（对老实例的行为）**：键是从 `instanceId + stepName + phase` 现场推导的，
+不依赖任何新增持久化字段，因此**升级前已落盘的老实例无需迁移**，恢复时自动获得同样的键。
+唯一限制：若业务侧在升级前没有记录过这些键，则对升级前已经生效、但确认丢失的个别动作，
+业务侧无从 retroactive 判重——这与任何幂等键方案的语义一致；升级后新下发的动作全部带键。
+
+### 5.3 重试与超时
 
 - 是否还有下一次尝试仅由 `usedAttempts < maxAttempts` 决定，退避为固定时长（无随机抖动），结论确定可复现。
 - 超时（`TimeoutException`）与业务异常分别记录为 `TIMEOUT` / `FAILURE`，在步骤的 `records` 中可区分。
@@ -146,7 +165,7 @@ orch.recoverAll();           // 重启/重新初始化后恢复未完成实例
 
 ---
 
-## 7. 重启 / 重新初始化恢复
+## 7. 重启 / 重新初始化恢复（含在途崩溃）
 
 - 编排器所有状态（实例、步骤、轨迹、守卫）均在每次状态迁移时原子写盘（临时文件 + rename）。
 - `recoverAll()`（Spring 启动时由 `SagaStartupRecovery` 自动执行）扫描持久化目录，
@@ -154,7 +173,28 @@ orch.recoverAll();           // 重启/重新初始化后恢复未完成实例
   - `SUCCEEDED` 步骤跳过、`COMPENSATED` 补偿跳过 —— 不重复执行已确认工作；
   - `COMPENSATION_FAILED` 的补偿会被再次尝试 —— 不跳过错过的补偿；
   - 守卫记录随磁盘恢复，`DONE` 仍然短路。
-- 若某类型在当前进程未注册定义，则跳过并告警；注册定义后再次调用 `recoverAll()` 即可。
+- **恢复与定义加载顺序无关**：若恢复扫描时某类型尚未注册定义，该实例先跳过并告警；
+  之后 `register()` 注册该类型时会**自动补扫并恢复**该类型的所有未完成实例，
+  保证无论自动恢复先跑还是定义先加载，都不会漏掉任何应继续推进的实例。
+- **恢复幂等**：`recoverAll()` 可重复调用、可并发调用（含多个进程/编排器实例指向同一存储目录）。
+  竞争同一实例的恢复由「守卫 fencing + 乐观版本」收敛：胜出者推进状态，
+  竞争失败方的过期写入被 `VERSION_CONFLICT` 拒绝并记录日志，不产生额外副作用。
+
+### 7.1 在途崩溃恢复规则（动作已下发、结果未确认）
+
+崩溃瞬间守卫记录停留在 `IN_FLIGHT`（动作已下发、结果未知）。重启后按守卫状态分三种收敛：
+
+| 崩溃现场（磁盘上的守卫 / 步骤状态） | 恢复处置 | 副作用保证 |
+| --- | --- | --- |
+| `IN_FLIGHT` / 步骤 `RUNNING`（或 `COMPENSATING`） | 以**同一 `dedupKey` 重放**该动作，轨迹写 `IN_FLIGHT_RECOVERED` 说明判定依据 | 业务侧凭 `dedupKey` 判重，已生效的不会再生效第二次 |
+| `DONE` / 步骤仍 `RUNNING`（确认已落盘、实例状态没落盘） | **不重放**，直接采用守卫中已确认的结果把步骤置为成功 | 已确认的动作绝不重复调用 |
+| `FAILED` / 步骤 `FAILED` | 按确定重试策略继续（未耗尽时）或走补偿 | 与正常失败路径一致 |
+
+补偿链路同样适用：补偿动作在途崩溃后，恢复会重放该补偿（同一 `dedupKey`），
+已生效的补偿由业务侧判重挡掉，**未完成的补偿不会因为重启被跳过**。
+
+恢复后实例收敛到唯一终态，快照中实例状态、步骤状态与守卫结论互相一致；
+每一次在途处置都能在轨迹中找到对应事件与原因。
 
 配置项（`application.properties`）：
 
@@ -170,7 +210,17 @@ saga.recover-on-startup=true       # 启动是否自动恢复
 `SagaSnapshot` 包含：实例状态、版本、每步状态 / 尝试次数 / 补偿次数 / 最近错误 / 步骤结果 /
 每次尝试记录（`AttemptRecord`：阶段、序号、SUCCESS/FAILURE/TIMEOUT、错误、起止时间），
 以及按时间排列的完整 `TraceEvent` 轨迹（提交、去重、开始、重试、超时、成功、失败、
-补偿开始 / 重试 / 成功 / 失败、整体完成 / 补偿完成、恢复、拒绝）。
+补偿开始 / 重试 / 成功 / 失败、整体完成 / 补偿完成、恢复、在途重放、拒绝）。
+
+每个步骤视图 `StepView` 额外暴露：
+
+| 字段 | 含义 |
+| --- | --- |
+| `forwardDedupKey` / `compensationDedupKey` | 正向 / 补偿动作的稳定去重标识（见 5.2） |
+| `inFlightPhase` | `FORWARD` / `COMPENSATE`：该阶段动作已下发、结果未确认（在途中间态）；`null` 表示无悬空动作 |
+
+崩溃后、恢复前查询快照，可直接凭 `inFlightPhase` 看出「哪一步悬在未知结果上」；
+恢复后通过轨迹中的 `IN_FLIGHT_RECOVERED` 事件（含所用 `dedupKey`）解释处置依据。
 
 HTTP 接口（`SagaController`）：
 
@@ -197,8 +247,33 @@ HTTP 接口（`SagaController`）：
 | 超时计入尝试、重试成功、TIMEOUT/FAILURE 可区分 | `SagaOrchestratorTest.timeoutIsRetriedAndEffectivelyCompletesOnce` |
 | 重新初始化后恢复：不重复已确认工作、不跳过补偿 | `SagaOrchestratorTest.recoversAcrossReinitialisationWithoutRepeatingConfirmedWork` |
 | 五类拒绝原因可区分 | `SagaOrchestratorTest.rejectsWithDistinguishableReasons` |
+| 正向动作在途崩溃：重放同键、副作用不重复、恢复快照/轨迹可解释 | `InFlightCrashRecoveryTest.forwardInFlightCrashRecoversToUniqueTerminalState` |
+| 补偿动作在途崩溃：补偿被重放而非跳过、不重复生效 | `InFlightCrashRecoveryTest.compensationInFlightCrashIsReplayedNotSkipped` |
+| 确认已落盘但实例状态未落盘：采用守卫结论、绝不重放 | `InFlightCrashRecoveryTest.confirmedButUnpersistedEffectIsAdoptedWithoutReexecution` |
+| 多进程并发恢复 + 重复恢复：结论一致、副作用仅一次 | `InFlightCrashRecoveryTest.concurrentAndRepeatedRecoveryStaysIdempotent` |
+| 去重标识跨重试/重启稳定、跨动作不撞车 | `InFlightCrashRecoveryTest.dedupKeyIsStableAcrossRetriesAndDistinctAcrossActions` |
 | 创建去重、版本冲突、磁盘扫描恢复 | `FileSagaStoreTest` |
 | Spring 装配、HTTP 提交/查询/补偿、拒绝码、端到端补偿 | `SagaIntegrationTest` |
 
 测试日志会打印每次输入（`[input]`/`[submit]`）、状态迁移（`[transition]`）、
-守卫判定（`[guard] ... previous=...`）与断言依据（`判定依据：...`）。
+守卫判定（`[guard] ... previous=...`）、业务侧判重（`[business] ... APPLIED/SUPPRESSED`）
+与断言依据（`判定依据：...`）。
+
+### 在本地复现在途崩溃恢复
+
+```bash
+# 只跑在途崩溃恢复用例，日志可见：崩溃现场 -> 在途快照 -> 重放判重 -> 唯一终态
+mvn test -Dtest=InFlightCrashRecoveryTest
+```
+
+手工复现（正向链路）：
+
+```bash
+# 1. 用一个会挂起的动作提交实例（模拟副作用生效后进程崩溃），随后杀掉进程；
+#    存储目录（默认 target/saga-store）里此时是：实例 RUNNING + 守卫 IN_FLIGHT。
+# 2. 重启应用（saga.recover-on-startup=true），或调用：
+#      GET  /saga/{instanceId}   # 恢复前：steps[0].inFlightPhase == "FORWARD"
+#      POST 任意触发 recoverAll()（Java API），或重新 register 该类型定义
+# 3. 再次 GET /saga/{instanceId}：实例收敛到 COMPLETED，
+#    traces 中含 IN_FLIGHT_RECOVERED（带 dedupKey），业务侧日志可见重放被判重挡掉。
+```

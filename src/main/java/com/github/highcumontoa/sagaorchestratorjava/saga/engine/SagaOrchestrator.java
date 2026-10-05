@@ -86,6 +86,12 @@ public class SagaOrchestrator {
         }
         definitions.put(definition.type(), definition);
         log.info("[orchestrator] registered saga type='{}' steps={}", definition.type(), signature(definition));
+        // 定义加载可能晚于自动恢复：注册时补扫该类型的未完成实例，保证顺序无关、不漏恢复
+        int resumed = recoverWhere(inst -> definition.type().equals(inst.getType()));
+        if (resumed > 0) {
+            log.info("[orchestrator] registration of type='{}' resumed {} pending instance(s)",
+                    definition.type(), resumed);
+        }
     }
 
     private static List<String> signature(SagaDefinition d) {
@@ -161,8 +167,18 @@ public class SagaOrchestrator {
     // 恢复 / 状态机驱动
     // ---------------------------------------------------------------------
 
-    /** 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。 */
+    /** 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。幂等：可重复、可并发调用。 */
     public int recoverAll() {
+        return recoverWhere(inst -> true);
+    }
+
+    /**
+     * 扫描并恢复满足条件的未完成实例。
+     *
+     * <p>单个实例恢复失败（例如与另一个并发恢复竞争的版本冲突）不影响其他实例；
+     * 竞争失败的一方的写入会被乐观版本拒绝，最终状态由胜出者收敛，本方法随后重读即可见。
+     */
+    private int recoverWhere(java.util.function.Predicate<SagaInstance> filter) {
         List<SagaInstance> all = store.findAll();
         int recovered = 0;
         for (SagaInstance inst : all) {
@@ -170,7 +186,7 @@ public class SagaOrchestrator {
             boolean unfinished = status == SagaStatus.PENDING || status == SagaStatus.RUNNING
                     || status == SagaStatus.COMPENSATING
                     || status == SagaStatus.COMPENSATION_FAILED;
-            if (!unfinished) {
+            if (!unfinished || !filter.test(inst)) {
                 continue;
             }
             ReentrantLock lock = executionLocks.computeIfAbsent(inst.getInstanceId(), k -> new ReentrantLock());
@@ -191,6 +207,11 @@ public class SagaOrchestrator {
                 log.info("[recover] resuming instance={} from status={}", fresh.getInstanceId(), fresh.getStatus());
                 resume(fresh, resolved);
                 recovered++;
+            } catch (SagaRejectedException conflict) {
+                // 与并发恢复/提交竞争：本次写入被拒绝，实例由另一方推进；重读确认后视为已收敛
+                SagaStatus now = store.find(inst.getInstanceId()).map(SagaInstance::getStatus).orElse(null);
+                log.info("[recover] instance={} concurrent recovery lost the race ({}) -> current status={}, "
+                        + "no duplicate side effect produced", inst.getInstanceId(), conflict.getReason(), now);
             } finally {
                 lock.unlock();
             }
@@ -343,9 +364,21 @@ public class SagaOrchestrator {
                 log.info("[{}] instance={} step={} guard DONE(attempt={}) -> reuse result, skip action",
                         phase, inst.getInstanceId(), step.name(), br.previousAttempt());
                 finishStepSuccess(inst, se, compensate, reused, attempt,
-                        "idempotent reuse: side effect already confirmed at attempt " + br.previousAttempt(),
+                        "idempotent reuse: side effect already confirmed at attempt " + br.previousAttempt()
+                                + " (guard DONE reconciled with step state, no re-execution)",
                         compensate ? TraceType.STEP_COMPENSATED : TraceType.STEP_SUCCEEDED);
                 return true;
+            }
+            if (IdempotentActionGuard.IN_FLIGHT.equals(br.previousState())) {
+                // 崩溃/超时遗留的在途记录：动作已下发但结果未知。
+                // 处置：以同一 dedupKey 重放，业务侧凭 dedupKey 判重，保证副作用不重复生效。
+                String dedupKey = IdempotentActionGuard.key(inst.getInstanceId(), step.name(), phase);
+                trace(inst, TraceType.IN_FLIGHT_RECOVERED, step.name(),
+                        "found IN_FLIGHT guard from attempt " + br.previousAttempt()
+                                + " (action dispatched before crash/restart, outcome unknown); "
+                                + "replaying with stable dedupKey=" + dedupKey
+                                + " -> business side must deduplicate by this key; "
+                                + "compensation already done is not skipped");
             }
 
             se.setStatus(compensate
@@ -358,7 +391,7 @@ public class SagaOrchestrator {
                             + " (guard previous=" + br.previousState() + ") timeout=" + step.timeoutMillis() + "ms");
             persist(inst);
 
-            ActionContext ctx = buildContext(inst, def, step, attempt);
+            ActionContext ctx = buildContext(inst, def, step, attempt, phase);
             AttemptRecord rec = new AttemptRecord();
             rec.setAttempt(attempt);
             rec.setPhase(phase);
@@ -454,15 +487,18 @@ public class SagaOrchestrator {
         persist(inst);
     }
 
-    private ActionContext buildContext(SagaInstance inst, SagaDefinition def, StepDefinition current, int attempt) {
+    private ActionContext buildContext(SagaInstance inst, SagaDefinition def, StepDefinition current,
+                                       int attempt, String phase) {
         Map<String, Object> results = new LinkedHashMap<>();
         for (StepExecution se : inst.getSteps()) {
             if (se.getStatus() == com.github.highcumontoa.sagaorchestratorjava.saga.model.StepStatus.SUCCEEDED) {
                 results.put(se.getName(), se.getResult());
             }
         }
+        // 稳定去重标识：与幂等守卫同键，确定性推导，跨重试/重启/重复触发不变
+        String dedupKey = IdempotentActionGuard.key(inst.getInstanceId(), current.name(), phase);
         return new ActionContext(inst.getInstanceId(), current.name(), attempt,
-                inst.getBusinessId(), inst.getInput(), results);
+                inst.getBusinessId(), inst.getInput(), results, dedupKey);
     }
 
     // ---------------------------------------------------------------------
@@ -481,11 +517,27 @@ public class SagaOrchestrator {
         List<SagaSnapshot.StepView> views = inst.getSteps().stream()
                 .map(se -> new SagaSnapshot.StepView(se.getName(), se.getIndex(), se.getStatus(),
                         se.getAttempts(), se.getCompensationAttempts(), se.getLastError(), se.getResult(),
-                        List.copyOf(se.getRecords())))
+                        List.copyOf(se.getRecords()),
+                        IdempotentActionGuard.key(inst.getInstanceId(), se.getName(), PHASE_FORWARD),
+                        IdempotentActionGuard.key(inst.getInstanceId(), se.getName(), PHASE_COMPENSATE),
+                        inFlightPhase(inst.getInstanceId(), se.getName())))
                 .toList();
         return new SagaSnapshot(inst.getInstanceId(), inst.getType(), inst.getBusinessId(),
                 inst.getStatus(), inst.getVersion(), views, List.copyOf(inst.getTraces()),
                 inst.getUpdatedMillis());
+    }
+
+    /** 若某阶段动作已下发但结果未确认（守卫处于 IN_FLIGHT），返回该阶段，否则返回 null。 */
+    private String inFlightPhase(String instanceId, String stepName) {
+        for (String phase : List.of(PHASE_FORWARD, PHASE_COMPENSATE)) {
+            boolean inFlight = guard.inspect(IdempotentActionGuard.key(instanceId, stepName, phase))
+                    .map(rec -> IdempotentActionGuard.IN_FLIGHT.equals(rec.getState()))
+                    .orElse(false);
+            if (inFlight) {
+                return phase;
+            }
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------------

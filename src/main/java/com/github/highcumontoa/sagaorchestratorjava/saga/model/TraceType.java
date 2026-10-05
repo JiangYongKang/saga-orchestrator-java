@@ -20,5 +20,7 @@ public enum TraceType {
     COMPLETED,
     COMPENSATED_ALL,
     RECOVERED,
+    /** 恢复时发现「动作已下发、结果未确认」的在途守卫记录，决定以同一去重标识重放。 */
+    IN_FLIGHT_RECOVERED,
     REJECTED
 }

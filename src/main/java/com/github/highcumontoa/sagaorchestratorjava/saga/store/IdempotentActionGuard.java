@@ -54,6 +54,15 @@ public class IdempotentActionGuard {
     }
 
     /**
+     * 只读查看某个键的守卫状态（供快照/轨迹解释在途中间态），不改变任何状态。
+     *
+     * @return 守卫记录；从未下发过动作时返回 empty
+     */
+    public Optional<GuardRecord> inspect(String key) {
+        return store.findGuard(key);
+    }
+
+    /**
      * 尝试开始一次受守卫保护的动作。
      *
      * @param attempt 本次尝试序号（从 1 开始，单调递增）
