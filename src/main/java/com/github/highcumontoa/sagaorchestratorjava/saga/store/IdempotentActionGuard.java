@@ -4,8 +4,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 动作级幂等守卫。
@@ -21,7 +19,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>为处理“超时后旧尝试迟到回调”，每次 begin 带单调递增的 attempt（fencing token），
  * complete/fail 时必须与当前 attempt 一致才接受；旧尝试的迟到结果被丢弃。
  *
- * <p>记录落盘，重启后守卫依然有效；同一键在进程内加锁，避免并发线程同时穿透。
+ * <p>记录落盘，重启后守卫依然有效。判状态 → 落盘变迁的整段临界区由
+ * {@link SagaStore#withGuardLock} 串行化：同一个 JVM 内、以及共享同一份持久化的多个 JVM
+ * （多个恢复者）之间，对同一守卫键的 begin 都严格排队——先入者把守卫置为 IN_FLIGHT 并执行，
+ * 后入者看到 DONE 就短路复用，不会有两个恢复者同时穿透并真正调用业务动作。
  */
 public class IdempotentActionGuard {
 
@@ -43,7 +44,6 @@ public class IdempotentActionGuard {
     private static final Logger log = LoggerFactory.getLogger(IdempotentActionGuard.class);
 
     private final SagaStore store;
-    private final ConcurrentHashMap<String, ReentrantLock> locks = new ConcurrentHashMap<>();
 
     public IdempotentActionGuard(SagaStore store) {
         this.store = store;
@@ -61,9 +61,7 @@ public class IdempotentActionGuard {
      *         NEW_EXECUTION 表示可以执行
      */
     public BeginResult begin(String key, int attempt) {
-        ReentrantLock lock = locks.computeIfAbsent(key, k -> new ReentrantLock());
-        lock.lock();
-        try {
+        return store.withGuardLock(key, () -> {
             Optional<GuardRecord> existing = store.findGuard(key);
             if (existing.isPresent() && DONE.equals(existing.get().getState())) {
                 GuardRecord done = existing.get();
@@ -82,16 +80,12 @@ public class IdempotentActionGuard {
             log.info("[guard] key={} begin attempt={} (previous={}/{}) -> allow execution",
                     key, attempt, previousState, previousAttempt);
             return new BeginResult(Outcome.NEW_EXECUTION, previousState, previousAttempt, null);
-        } finally {
-            lock.unlock();
-        }
+        });
     }
 
     /** 仅当 attempt 与当前守卫记录一致时接受成功回调，丢弃迟到的旧尝试结果。 */
     public boolean complete(String key, int attempt, String resultJson) {
-        ReentrantLock lock = locks.computeIfAbsent(key, k -> new ReentrantLock());
-        lock.lock();
-        try {
+        return store.withGuardLock(key, () -> {
             GuardRecord record = store.findGuard(key).orElse(null);
             if (record == null || record.getAttempt() != attempt || !IN_FLIGHT.equals(record.getState())) {
                 log.warn("[guard] key={} stale success callback attempt={} ignored (current={}/{})",
@@ -107,16 +101,12 @@ public class IdempotentActionGuard {
             store.saveGuard(record);
             log.info("[guard] key={} attempt={} -> DONE", key, attempt);
             return true;
-        } finally {
-            lock.unlock();
-        }
+        });
     }
 
     /** 仅当 attempt 与当前守卫记录一致时接受失败回调。 */
     public boolean fail(String key, int attempt, String error) {
-        ReentrantLock lock = locks.computeIfAbsent(key, k -> new ReentrantLock());
-        lock.lock();
-        try {
+        return store.withGuardLock(key, () -> {
             GuardRecord record = store.findGuard(key).orElse(null);
             if (record == null || record.getAttempt() != attempt || !IN_FLIGHT.equals(record.getState())) {
                 log.warn("[guard] key={} stale failure callback attempt={} ignored (current={}/{})",
@@ -131,8 +121,6 @@ public class IdempotentActionGuard {
             store.saveGuard(record);
             log.info("[guard] key={} attempt={} -> FAILED ({})", key, attempt, error);
             return true;
-        } finally {
-            lock.unlock();
-        }
+        });
     }
 }

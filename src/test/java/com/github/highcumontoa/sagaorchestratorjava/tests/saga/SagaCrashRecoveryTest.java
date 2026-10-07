@@ -92,6 +92,13 @@ class SagaCrashRecoveryTest {
         return t;
     }
 
+    /** 放行被阻塞的「被杀进程」动作线程并随即中断它，使其立刻退出、不触碰新进程的锁与落盘状态。 */
+    private static void releaseKilledProcess(CountDownLatch block, Thread corpse) throws InterruptedException {
+        block.countDown();
+        corpse.interrupt();
+        corpse.join(5000);
+    }
+
     /** 等待某步进入「在途」中间态（动作已下发、确认未落盘）。 */
     private static SagaSnapshot.StepView awaitInFlight(SagaOrchestrator orch, String instanceId,
                                                        String stepName) throws InterruptedException {
@@ -137,7 +144,7 @@ class SagaCrashRecoveryTest {
                     }
                     return "DEBITED";
                 }, null, 1, 0L, 0L))));
-        submitInBackground(killed, "crash-flow", "inst-c1");
+        Thread killedThread = submitInBackground(killed, "crash-flow", "inst-c1");
 
         SagaSnapshot.StepView inFlight = awaitInFlight(killed, "inst-c1", "debit");
         assertEquals(StepStatus.RUNNING, inFlight.status());
@@ -180,7 +187,8 @@ class SagaCrashRecoveryTest {
         assertEquals(1, ledger.sideEffects());
         assertEquals(SagaStatus.COMPLETED, restarted.snapshot("inst-c1").status());
 
-        blockKilledProcess.countDown(); // 释放「尸体」线程，其迟到写将被乐观版本/守卫拒绝
+        // 释放「尸体」线程并中断：其迟到写将被乐观版本/跨进程锁拒绝，随后线程立刻退出
+        releaseKilledProcess(blockKilledProcess, killedThread);
     }
 
     // 2. 补偿动作在途崩溃：补偿不重复生效、也不因重启被跳过 ------------------
@@ -212,7 +220,7 @@ class SagaCrashRecoveryTest {
                 new StepDefinition("charge", ctx -> {
                     throw new IllegalStateException("card declined");
                 }, null, 1, 0L, 0L))));
-        submitInBackground(killed, "comp-crash-flow", "inst-c2");
+        Thread killedThread = submitInBackground(killed, "comp-crash-flow", "inst-c2");
 
         SagaSnapshot.StepView inFlight = awaitInFlight(killed, "inst-c2", "reserve");
         assertEquals(StepStatus.COMPENSATING, inFlight.status());
@@ -255,7 +263,7 @@ class SagaCrashRecoveryTest {
         assertEquals(StepStatus.COMPENSATED, after.steps().get(0).status());
         assertEquals(StepStatus.FAILED, after.steps().get(1).status());
 
-        blockKilledProcess.countDown();
+        releaseKilledProcess(blockKilledProcess, killedThread);
     }
 
     // 3. 恢复扫描先于定义注册：定义补齐后自动补恢复，不漏实例 ----------------
@@ -276,7 +284,7 @@ class SagaCrashRecoveryTest {
                     }
                     return "DEBITED";
                 }, null, 1, 0L, 0L))));
-        submitInBackground(killed, "late-def-flow", "inst-c3");
+        Thread killedThread = submitInBackground(killed, "late-def-flow", "inst-c3");
         awaitInFlight(killed, "inst-c3", "debit");
         log.info("[crash-sim] process killed with in-flight action; restarting WITHOUT definition first");
 
@@ -306,7 +314,7 @@ class SagaCrashRecoveryTest {
         assertEquals(1, ledger.sideEffects());
         assertTrue(after.traces().stream().anyMatch(t -> t.getType() == TraceType.IN_FLIGHT_RECOVERED));
 
-        blockKilledProcess.countDown();
+        releaseKilledProcess(blockKilledProcess, killedThread);
     }
 
     // 4. 并发 + 重复恢复：结论一致、副作用不增多 ----------------------------
@@ -327,7 +335,7 @@ class SagaCrashRecoveryTest {
                     }
                     return "DEBITED";
                 }, null, 1, 0L, 0L))));
-        submitInBackground(killed, "conc-recover-flow", "inst-c4");
+        Thread killedThread = submitInBackground(killed, "conc-recover-flow", "inst-c4");
         awaitInFlight(killed, "inst-c4", "debit");
 
         SagaOrchestrator restarted = newOrchestrator();
@@ -379,7 +387,7 @@ class SagaCrashRecoveryTest {
         assertEquals(1, inFlightTraces);
         assertEquals(2, ledger.invocations().size());
 
-        blockKilledProcess.countDown();
+        releaseKilledProcess(blockKilledProcess, killedThread);
     }
 
     // 5. 稳定去重标识：跨重试不变、不同动作互不撞车 --------------------------

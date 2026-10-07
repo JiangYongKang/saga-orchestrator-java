@@ -12,7 +12,7 @@
 ## 1. 快速开始
 
 ```bash
-# 运行全部测试（20 个，含单元、持久化、崩溃恢复、Spring 集成测试），无需任何外部服务
+# 运行全部测试（23 个，含单元、持久化、崩溃恢复、多恢复者并发恢复、Spring 集成测试），无需任何外部服务
 mvn test
 
 # 只跑编排器核心用例（可看到完整的输入/迁移/判定日志）
@@ -20,6 +20,9 @@ mvn test -Dtest=SagaOrchestratorTest
 
 # 只跑在途崩溃恢复用例（动作已下发、确认未落盘时进程被杀）
 mvn test -Dtest=SagaCrashRecoveryTest
+
+# 只跑「多个恢复者共享同一份存储并发恢复 + 恢复完手动补跑」专项（正向 + 补偿 + 跨入口）
+mvn test -Dtest=ConcurrentRecoveryTest
 ```
 
 默认持久化目录为 `target/saga-store/`（可用配置项覆盖，见第 7 节），
@@ -45,7 +48,9 @@ r.snapshot().status();       // COMPLETED / COMPENSATED / COMPENSATION_FAILED ..
 r.deduplicated();            // 是否为重复/并发提交的去重返回
 orch.snapshot("order-1");    // 可解释快照：每步状态 + 完整轨迹
 orch.triggerCompensation("order-1"); // 补偿失败后手动重试（幂等）
-orch.recoverAll();           // 重启/重新初始化后恢复未完成实例
+orch.recoverAll();           // 重启/重新初始化后恢复未完成实例（幂等、可并发调用）
+orch.recoverAllReport();     // 同上，但返回分类报告：recovered / deferred（冲突认输）/
+                             // alreadyTerminal / awaitingDefinition / failed，便于排查并发恢复
 ```
 
 ---
@@ -119,6 +124,9 @@ orch.recoverAll();           // 重启/重新初始化后恢复未完成实例
    再加每实例执行锁串行化，收敛到同一终态；非创建者返回 `deduplicated=true` 并追加 `SUBMIT_DEDUP` 轨迹。
 2. **动作级幂等守卫 `IdempotentActionGuard`**：以 `instanceId|step|FORWARD|COMPENSATE` 为键落盘，
    状态机为 `IN_FLIGHT → DONE / FAILED`。已 `DONE` 直接短路，业务动作不会被再次调用。
+   守卫的「判状态 → 落盘变迁」临界区由 `SagaStore.withGuardLock` 串行化，
+   文件存储实现里该锁是跨 JVM 的（同一进程内多编排器、共享目录的多进程都排队），
+   因此多个恢复者并发恢复同一在途动作时，不会有两个恢复者同时穿透并真正调用业务动作。
 3. **尝试令牌（fencing token）**：每次尝试带单调递增 `attempt`；超时后旧线程的迟到成功/失败回调，
    若 `attempt` 与当前守卫不符则被丢弃，不能污染新尝试的状态。
 
@@ -167,8 +175,19 @@ new StepDefinition("debit", ctx -> {
 
 ## 6. 并发控制与拒绝原因
 
-- 每实例一把可重入执行锁：同一实例的提交、补偿、恢复串行化；不同实例互不阻塞。
-- 乐观版本号：实例每次落盘 `version+1`，过期写入抛 `VERSION_CONFLICT`（HTTP 409）。
+- 每实例一把可重入执行锁：同一 JVM 内同一实例的提交、补偿、恢复串行化；不同实例互不阻塞。
+- **跨 JVM 文件锁**：`FileSagaStore` 在持久化目录的 `locks/` 下维护实例锁与守卫锁
+  （JVM 内 `ReentrantLock` + OS `FileLock` 双层，自旋等待、可中断，临界区结束即删除锁文件；
+  进程崩溃时 OS 锁由内核自动回收，不会留下死锁）。因此「多个实例 / 多个进程共享同一份存储
+  各自恢复」也被严格串行化：
+  - 实例创建（`createIfAbsent`）跨进程原子，并发提交只有唯一创建者；
+  - 实例状态的「读版本 → 比较 → 写」CAS 区间跨进程互斥；
+  - 同一守卫键的「判状态 → 落盘变迁 → 真正调用动作」跨进程互斥，两个恢复者不会同时穿透同一动作。
+- 乐观版本号：实例每次落盘 `version+1`。并发恢复同一实例时，只有一个恢复者的 CAS 获胜；
+  败者收到 `VERSION_CONFLICT` 后由编排器**安静收敛**——按「该实例已经被别人推进」处理，
+  立刻继续恢复后面的实例（见 7.2 节），不会把异常抛给 `recoverAll()` 的调用方、也不会整批中断。
+  提交 / 手动补偿与恢复在入口处撞车时，则在实例锁内重读最新状态、按幂等状态机重新驱动，
+  调用方始终拿到收敛后的快照而非冲突报错。
 - 所有被拒绝操作抛 `SagaRejectedException`，携带可枚举区分的 `RejectReason`：
 
 | `RejectReason` | 触发情形 | HTTP |
@@ -176,7 +195,7 @@ new StepDefinition("debit", ctx -> {
 | `UNKNOWN_INSTANCE` | 操作/查询不存在的实例 | 404 |
 | `ILLEGAL_STATE` | 非法状态跳转（如对 COMPLETED 发起补偿）、提交未注册类型 | 422 |
 | `CONCURRENT_CONFLICT` | 同一实例正被其他执行占用（保留给并发互斥场景） | 409 |
-| `VERSION_CONFLICT` | 乐观版本不匹配的过期写入 | 409 |
+| `VERSION_CONFLICT` | 乐观版本不匹配的过期写入；恢复场景下被编排器内部安静收敛，不外抛 | 409 |
 | `CONFLICTING_DEFINITION` | 同名类型重复注册但步骤结构不同；同一实例以不同类型提交 | 422 |
 
 ---
@@ -210,12 +229,45 @@ new StepDefinition("debit", ctx -> {
    - 真正生效过的业务操作不会第二次生效——业务用 `actionKey` 认出重放并短路；
    - 没做完的补偿不会因为这次重启被跳过——`COMPENSATING` 中的补偿同样按上述规则重放；
    - 恢复幂等——`recoverAll()` 在实例锁内重读状态，已被并发恢复推进到终态的实例
-     直接收敛（不计数、不追加矛盾轨迹）；自动恢复后再手动恢复、多个恢复并发跑，
-     副作用都不会增多，轨迹中只出现一次恢复结论。
+     直接收敛（不计数、不追加矛盾轨迹）；自动恢复后再手动恢复、多个恢复者并发跑，
+     副作用都不会增多，落盘轨迹中只出现一条恢复结论（详见 7.2）。
 4. **可解释**：快照的每个步骤视图带 `actionKey` / `compensationKey` / `inFlight` /
    `inFlightAttempt` 字段。`inFlight=true` 即「动作已下发、结果还没确定」的在途
    中间态（崩溃遗留或正在执行都可据此识别）；恢复完成后该标记清零，
    不会出现「步骤 RUNNING 但实例已终态」这类矛盾结论。
+
+### 7.2 并发 / 多恢复者恢复语义
+
+崩溃恢复在设计上允许**任意多个恢复者并发跑**，包括：服务启动的自动恢复与运维手动触发的恢复
+撞在一起；多个应用实例共享同一份持久化目录各自启动恢复；恢复完成后又手动补跑一次。
+
+规则如下：
+
+1. **每个恢复调用都正常跑完，绝不抛错、绝不整批中断。**
+   `recoverAll()` 逐实例处理，单个实例的任何异常都被隔离在该实例身上（记入报告 `failed`，
+   下一轮恢复再试），后面的待恢复实例照常处理，不会因为一次冲突把其它实例漏掉。
+2. **冲突按「该实例已经被别人推进」安静认输。**
+   多个恢复者在同一落盘版本上恢复同一实例时，只有一个 CAS 获胜、真正推进；败者在实例锁内
+   或 CAS 失败点重读状态，发现实例已被接管 / 已到终态，即放弃本轮、不计恢复数，
+   继续处理后面的实例。败者**不重试**——再抢一次只会让两个恢复者都执行业务动作，没有收益。
+3. **副作用不随并发或补跑增多，补偿也不被跳过。**
+   - 守卫临界区（跨 JVM）保证同一「实例+步骤+阶段」的 `begin` 排队：先入者真正调用动作，
+     后入者看到 `IN_FLIGHT/DONE`；确认 `DONE` 后所有恢复者一律短路复用，业务动作不会再被调用；
+   - 崩溃遗留的 `IN_FLIGHT`（结果未知）由获胜者以**同一个稳定 actionKey** 重放一次，
+     业务侧按 key 判重保证「已落地的不二次生效」；败者根本不进入重放；
+   - `COMPENSATING` 中的在途补偿适用完全相同的规则：未完成的补偿一定会被继续到终态，
+     且不会第二次生效。
+4. **结论唯一、可解释。**
+   落盘版本链是单条线性链（CAS 串行），因此实例最终只有一个状态：`COMPLETED` / `COMPENSATED`
+   等终态；终态快照里所有步骤都终态、`inFlight` 清零。获胜恢复者写的 `RECOVERED` 恢复结论
+   与 `IN_FLIGHT_RECOVERED` 在途处置轨迹在盘上各至多一条，败者那条写不进盘（随失败 CAS 丢弃），
+   快照与执行轨迹能直接看出「这次是怎么收敛的、为什么收敛到这个结论」。
+5. **恢复结果可分类查看。**
+   `int recoverAll()` 保持旧签名（返回真正推进的实例数）；新增
+   `RecoveryReport recoverAllReport()`，返回本次扫描数以及 `recovered`（我推进的）、
+   `deferred`（冲突认输、由别人推进的）、`alreadyTerminal`（本来就是终态）、
+   `awaitingDefinition`（缺定义暂缓）、`failed`（单实例异常隔离）五个分类 id 列表，
+   方便压测与排障时直接核对「谁推进、谁认输、有没有漏、有没有失败」。
 
 配置项（`application.properties`）：
 
@@ -223,6 +275,18 @@ new StepDefinition("debit", ctx -> {
 saga.store-dir=target/saga-store   # 本地持久化目录
 saga.recover-on-startup=true       # 启动是否自动恢复
 ```
+
+**并发恢复特性对已落盘老数据的行为（无需迁移）**：
+
+- 实例 JSON 与守卫 JSON 的字段**没有任何变化**，`actionKey` 仍是现场派生（见 5.2），
+  功能上线前落盘的老实例恢复时按同一规则识别 `IN_FLIGHT`、派生 key、重放收敛，
+  老格式实例的专门覆盖见
+  `SagaCrashRecoveryTest.legacyPersistedInstanceFromBeforeThisFeatureStillRecovers`；
+- 唯一新增的磁盘内容是 `store-dir/locks/` 下的锁文件，它们**不承载任何业务状态**，
+  只用于跨进程互斥：临界区结束即删除；进程崩溃残留的空锁文件下次自动复用（OS 锁已随
+  进程死亡被内核释放），因此删除整个 `locks/` 目录或保留它都安全，不影响恢复正确性；
+- 老版本进程与新版本进程**不应长期同时写同一目录**（老版本没有跨进程锁），
+  滚动升级时让老进程先退出即可；新版本之间共享目录并发恢复是受支持的常规用法。
 
 ---
 
@@ -265,6 +329,9 @@ HTTP 接口（`SagaController`）：
 | 并发 + 重复恢复幂等：副作用不增多、结论不矛盾 | `SagaCrashRecoveryTest.concurrentAndRepeatedRecoveryStaysIdempotent` |
 | 稳定去重标识：跨重试不变、不同动作互不撞车 | `SagaCrashRecoveryTest.actionKeyIsStableAcrossRetriesAndUniquePerAction` |
 | 老格式落盘实例免迁移恢复 | `SagaCrashRecoveryTest.legacyPersistedInstanceFromBeforeThisFeatureStillRecovers` |
+| **多恢复者共享同一存储并发恢复（正向链路，多实例）：不抛错、败者安静认输不漏实例、副作用不增多、补跑全 no-op** | `ConcurrentRecoveryTest.multipleRecoverersSharingOneStoreConvergeWithoutErrorsOrMissedInstances` |
+| **多恢复者并发恢复在途补偿：补偿不跳过也不重复、结论一致** | `ConcurrentRecoveryTest.concurrentRecoveryOfCrashMidCompensationNeitherSkipsNorDoubles` |
+| **启动自动恢复进行中与运维手动提交 / 手动恢复撞车：跨入口安静收敛** | `ConcurrentRecoveryTest.automaticRecoveryRacingWithManualSubmitAndReRecoveryConvergesQuietly` |
 | 创建去重、版本冲突、磁盘扫描恢复 | `FileSagaStoreTest` |
 | Spring 装配、HTTP 提交/查询/补偿、拒绝码、端到端补偿 | `SagaIntegrationTest` |
 
@@ -285,3 +352,38 @@ HTTP 接口（`SagaController`）：
 
 运行 `mvn test -Dtest=SagaCrashRecoveryTest` 即可在日志中完整看到
 输入、状态迁移与每一步判定依据。
+
+### 9.2 本地复现「多个恢复者并发恢复 + 恢复完手动补跑」
+
+`ConcurrentRecoveryTest` 不需要任何外部中间件，纯本地确定性复现压测里的并发恢复场景：
+
+1. **构造共享存储上的崩溃遗留状态**：直接往同一个 `@TempDir` 落盘若干份
+   「实例停在 `RUNNING/COMPENSATING`、步骤 `RUNNING/COMPENSATING`、守卫 `IN_FLIGHT`」的 JSON
+   （`stageCrashedInstance`），同时在 `BusinessLedger` 里用 `effectLandedBeforeCrash(...)`
+   登记「崩溃前已在业务侧落地、但确认丢失」的副作用——等价于动作已生效、进程在确认前被杀；
+2. **多个恢复者对齐后一起抢**：为每个编排器安装同一个按实例划分的一次性门闩
+   （`SagaOrchestrator#setRecoverySyncPoint`，仅测试用），所有恢复者在「落盘恢复结论之前」
+   被挡在同一落盘版本上，门一开同时 CAS——**稳定**制造冲突，而不是靠概率碰运气；
+3. **断言并发恢复不抛错、结论一致、副作用不增多**：
+   - 每个 `recoverAllReport()` 正常返回，`failed` 为空；每实例恰好一个恢复者进 `recovered`，
+     其余全部进 `deferred`（安静认输），三个实例一个不漏；
+   - 终态全部 `COMPLETED/COMPENSATED`，无 `inFlight` 残留，盘上 `RECOVERED` 结论只有一条；
+   - 正向链路：崩溃前已生效的动作重放被账本 `SUPPRESS`、未执行的动作生效一次；
+     补偿链路：在途补偿被以同一 key 重放并收敛，但不二次生效，`credit` 等失败步骤不被误补偿；
+4. **恢复完再让所有恢复者手动补跑一轮**：报告里 `recovered` 全空、全部 `alreadyTerminal`，
+   守卫 `DONE` 直接短路，业务动作不再被调用，副作用计数与调用计数都保持不变；
+5. **跨入口场景**：一个恢复者的自动恢复进行到一半时，另一个编排器并发做重复 `submit`
+   并再触发一次 `recoverAll`——两个入口都安静收敛到同一终态，调用方拿不到任何冲突异常。
+
+```bash
+mvn test -Dtest=ConcurrentRecoveryTest          # 三个并发恢复专项
+mvn test                                        # 全量 23 个用例（连续多跑也稳定）
+```
+
+日志里可以直接看到：`[input]` 崩溃遗留输入、`[sync]` 恢复者对齐、
+`[store] version conflict ... expected=2 actual=3`（败者 CAS）、
+`[recover] ... was advanced by a concurrent recoverer -> defer quietly`（认输依据）、
+`[guard] ... DONE -> suppress duplicate side effect`（副作用短路依据）、
+`[business] APPLY/SUPPRESS/PRE-CRASH`（业务侧生效/重放抑制/崩溃前已落地），
+以及每个恢复者最终的 `RecoveryReport{recovered, deferred, alreadyTerminal, ...}`。
+

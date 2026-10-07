@@ -58,6 +58,9 @@ public class SagaOrchestrator {
     private static final String PHASE_FORWARD = "FORWARD";
     private static final String PHASE_COMPENSATE = "COMPENSATE";
 
+    /** 跨恢复者 / 跨入口乐观冲突后，最多基于最新落盘状态重读重驱多少次后才放弃。 */
+    private static final int MAX_CAS_ATTEMPTS = 20;
+
     private final SagaStore store;
     private final IdempotentActionGuard guard;
     private final ObjectMapper mapper = new ObjectMapper();
@@ -65,6 +68,12 @@ public class SagaOrchestrator {
     /** recoverAll 时发现「有未完成实例但定义尚未注册」的类型；定义补齐后自动补恢复，保证不漏。 */
     private final java.util.Set<String> typesAwaitingDefinition = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<String, ReentrantLock> executionLocks = new ConcurrentHashMap<>();
+    /**
+     * 仅供确定性测试使用的恢复同步点：每个待恢复实例在写入「恢复结论」之前回调一次
+     * （参数为 instanceId），可借此让多个恢复者在同一状态版本上对齐，稳定复现 CAS 竞争。
+     * 生产环境不设置（null），行为完全不变。
+     */
+    private volatile java.util.function.Consumer<String> recoverySyncPoint;
     private final ExecutorService actionExecutors = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "saga-action-" + System.nanoTime());
         t.setDaemon(true);
@@ -76,6 +85,15 @@ public class SagaOrchestrator {
         this.store = store;
         this.guard = new IdempotentActionGuard(store);
         log.info("[orchestrator] created with store {}", store.getClass().getSimpleName());
+    }
+
+    /**
+     * 安装「恢复竞争点」回调：每个待恢复实例在落盘恢复结论前被回调一次。
+     * 仅用于并发恢复测试中把多个恢复者对齐到同一落盘版本，确定性复现冲突；
+     * 生产代码不要调用。传 null 移除。
+     */
+    public void setRecoverySyncPoint(java.util.function.Consumer<String> syncPoint) {
+        this.recoverySyncPoint = syncPoint;
     }
 
     // ---------------------------------------------------------------------
@@ -129,14 +147,51 @@ public class SagaOrchestrator {
         ReentrantLock lock = executionLocks.computeIfAbsent(instanceId, k -> new ReentrantLock());
         lock.lock();
         try {
-            SagaInstance fresh = require(instanceId);
-            if (duplicated) {
-                trace(fresh, TraceType.SUBMIT_DEDUP, null,
-                        "duplicate/concurrent submit converged to existing instance in status " + fresh.getStatus());
-                persist(fresh);
+            // 在实例锁内基于最新落盘状态驱动；若与另一个恢复者 / 提交者（其它 JVM）撞车导致
+            // 乐观版本冲突，重读最新状态、按幂等状态机重新驱动，调用方始终拿到收敛后的快照而非报错。
+            boolean dedupTraceWritten = false;
+            SagaSnapshot snapshot = null;
+            for (int attempt = 1; attempt <= MAX_CAS_ATTEMPTS; attempt++) {
+                SagaInstance fresh = require(instanceId);
+                if (duplicated && !dedupTraceWritten) {
+                    try {
+                        trace(fresh, TraceType.SUBMIT_DEDUP, null,
+                                "duplicate/concurrent submit converged to existing instance in status "
+                                        + fresh.getStatus());
+                        persist(fresh);
+                        dedupTraceWritten = true;
+                    } catch (SagaRejectedException conflict) {
+                        if (conflict.getReason() != RejectReason.VERSION_CONFLICT) {
+                            throw conflict;
+                        }
+                        log.info("[submit] instance={} dedup-trace write lost optimistic race at attempt={} "
+                                + "(advanced concurrently) -> re-read and retry", instanceId, attempt);
+                        continue; // 本轮未成功落盘任何内容，基于最新状态整轮重来
+                    }
+                }
+                try {
+                    resume(fresh, def);
+                    snapshot = toSnapshot(require(instanceId));
+                    break;
+                } catch (SagaRejectedException conflict) {
+                    if (conflict.getReason() != RejectReason.VERSION_CONFLICT) {
+                        throw conflict;
+                    }
+                    log.info("[submit] instance={} lost optimistic race while resuming at attempt={} "
+                            + "(advanced by a concurrent recoverer) -> re-read latest state and resume",
+                            instanceId, attempt);
+                    if (attempt == MAX_CAS_ATTEMPTS) {
+                        throw conflict;
+                    }
+                }
             }
-            resume(fresh, def);
-            SagaSnapshot snapshot = toSnapshot(require(instanceId));
+            if (snapshot == null) {
+                // 理论上不可达：上面的冲突在达到上限时已直接抛出；防御性兜底，绝不返回 null
+                throw new SagaRejectedException(RejectReason.VERSION_CONFLICT,
+                        "submit for instance " + instanceId
+                                + " kept losing optimistic races against concurrent recoverers; "
+                                + "call recoverAll or retry submit");
+            }
             log.info("[submit] decision: instanceId={} deduplicated={} finalStatus={}",
                     instanceId, duplicated, snapshot.status());
             return new SubmitResult(snapshot, duplicated);
@@ -172,39 +227,98 @@ public class SagaOrchestrator {
     // 恢复 / 状态机驱动
     // ---------------------------------------------------------------------
 
-    /** 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。幂等：可重复、可并发调用。 */
+    /**
+     * 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。
+     *
+     * <p>幂等且<b>可并发调用</b>：自动恢复、运维手动恢复、多个恢复者共享同一份存储同时跑都安全。
+     * 返回值为本调用真正推进的实例数；冲突败北（该实例已被别的恢复者推进）的不计入、也不抛错，
+     * 任何单个实例的异常都不会中断对其余实例的恢复。
+     */
     public int recoverAll() {
+        return recoverAllReport().recovered().size();
+    }
+
+    /**
+     * 与 {@link #recoverAll()} 相同的恢复动作，但返回可解释的分类报告：
+     * 哪些由本调用推进、哪些因并发冲突按「已被别人推进」认输跳过、
+     * 哪些本来就是终态 / 等待定义 / 发生了单实例异常。
+     */
+    public RecoveryReport recoverAllReport() {
         List<SagaInstance> all = store.findAll();
-        int recovered = 0;
+        List<String> recovered = new ArrayList<>();
+        List<String> deferred = new ArrayList<>();
+        List<String> alreadyTerminal = new ArrayList<>();
+        List<String> awaitingDefinition = new ArrayList<>();
+        List<String> failed = new ArrayList<>();
         for (SagaInstance inst : all) {
-            if (recoverInstance(inst)) {
-                recovered++;
+            if (isTerminal(inst.getStatus())) {
+                alreadyTerminal.add(inst.getInstanceId());
+                continue;
+            }
+            try {
+                switch (recoverInstance(inst)) {
+                    case RECOVERED -> recovered.add(inst.getInstanceId());
+                    case DEFERRED -> deferred.add(inst.getInstanceId());
+                    case AWAITING_DEFINITION -> awaitingDefinition.add(inst.getInstanceId());
+                }
+            } catch (RuntimeException perInstanceFailure) {
+                // 单个实例的任何异常都只隔离在它自己身上：记录后继续处理后面的待恢复实例，绝不整批中断
+                failed.add(inst.getInstanceId());
+                log.error("[recover] instance={} failed in this recovery pass and will be retried "
+                        + "on the next recoverAll(); remaining instances continue unaffected: {}",
+                        inst.getInstanceId(), perInstanceFailure.toString());
             }
         }
-        log.info("[recover] scanned {} instances, resumed {}", all.size(), recovered);
-        return recovered;
+        RecoveryReport report = new RecoveryReport(List.copyOf(recovered), List.copyOf(deferred),
+                List.copyOf(alreadyTerminal), List.copyOf(awaitingDefinition),
+                List.copyOf(failed), all.size());
+        log.info("[recover] scanned {} instances: recovered={}, deferredToOtherRecoverer={}, "
+                        + "alreadyTerminal={}, awaitingDefinition={}, failed={}",
+                all.size(), recovered, deferred, alreadyTerminal, awaitingDefinition, failed);
+        return report;
     }
 
     /** 只恢复某个类型的未完成实例（定义晚于恢复扫描注册时的补恢复）。 */
     private void recoverType(String type) {
         for (SagaInstance inst : store.findAll()) {
-            if (type.equals(inst.getType())) {
-                recoverInstance(inst);
+            if (type.equals(inst.getType()) && !isTerminal(inst.getStatus())) {
+                try {
+                    recoverInstance(inst);
+                } catch (RuntimeException perInstanceFailure) {
+                    // 补恢复同样不得因为单实例冲突/异常中断同类型其余实例
+                    log.error("[recover] deferred recovery for type={} instance={} failed; "
+                            + "will retry on next recoverAll(): {}",
+                            type, inst.getInstanceId(), perInstanceFailure.toString());
+                }
             }
         }
     }
 
+    /** 单个实例恢复的分类结论。 */
+    private enum RecoveryOutcome {
+        /** 本调用写入恢复结论并把实例推进到了终态。 */
+        RECOVERED,
+        /** 该实例在本调用处理期间已被并发的其它恢复者推进，本调用安静认输跳过。 */
+        DEFERRED,
+        /** 本进程缺少对应类型定义，已登记待补恢复。 */
+        AWAITING_DEFINITION
+    }
+
     /**
-     * 恢复单个实例；返回 true 表示本次调用确实推进了它。
-     * 在实例锁内重读状态：已被并发恢复推进到终态的实例直接收敛，不重复计数、不追加矛盾轨迹。
+     * 恢复单个实例。
+     *
+     * <p>在实例锁内重读状态：已被并发恢复推进到终态的实例直接收敛，不计数、不追加矛盾轨迹；
+     * 若落盘恢复结论（或恢复过程中的任何一次状态落盘）被另一个恢复者抢先——
+     * 即乐观版本 CAS 失败——说明该实例正由 / 已由别人推进，本调用按 {@link RecoveryOutcome#DEFERRED}
+     * 安静认输，绝不重试、绝不报错，交由 {@link #recoverAllReport()} 继续处理后面的实例。
      */
-    private boolean recoverInstance(SagaInstance scanned) {
+    private RecoveryOutcome recoverInstance(SagaInstance scanned) {
         SagaStatus status = scanned.getStatus();
         boolean unfinished = status == SagaStatus.PENDING || status == SagaStatus.RUNNING
                 || status == SagaStatus.COMPENSATING
                 || status == SagaStatus.COMPENSATION_FAILED;
         if (!unfinished) {
-            return false;
+            return RecoveryOutcome.DEFERRED;
         }
         ReentrantLock lock = executionLocks.computeIfAbsent(scanned.getInstanceId(), k -> new ReentrantLock());
         lock.lock();
@@ -212,8 +326,9 @@ public class SagaOrchestrator {
             SagaInstance fresh = require(scanned.getInstanceId());
             if (isTerminal(fresh.getStatus())) {
                 log.info("[recover] instance={} already converged to terminal {} by a concurrent recovery "
-                        + "-> idempotent no-op", fresh.getInstanceId(), fresh.getStatus());
-                return false;
+                        + "-> idempotent no-op (treated as advanced by another recoverer)",
+                        fresh.getInstanceId(), fresh.getStatus());
+                return RecoveryOutcome.DEFERRED;
             }
             SagaDefinition resolved = definitions.get(fresh.getType());
             if (resolved == null) {
@@ -222,17 +337,44 @@ public class SagaOrchestrator {
                         + "deferring recovery — it will resume automatically once the definition is registered "
                         + "(or call recoverAll again after registering)",
                         fresh.getInstanceId(), fresh.getType());
-                return false;
+                return RecoveryOutcome.AWAITING_DEFINITION;
             }
-            trace(fresh, TraceType.RECOVERED, null,
-                    "resume after (re)initialisation from status " + fresh.getStatus()
-                            + "; already-confirmed steps will not be re-executed");
-            persist(fresh);
-            log.info("[recover] resuming instance={} from status={}", fresh.getInstanceId(), fresh.getStatus());
-            resume(fresh, resolved);
-            return true;
+            // 确定性并发测试的竞争对齐点（生产环境为空）
+            java.util.function.Consumer<String> sync = recoverySyncPoint;
+            if (sync != null) {
+                sync.accept(fresh.getInstanceId());
+            }
+            try {
+                trace(fresh, TraceType.RECOVERED, null,
+                        "resume after (re)initialisation from status " + fresh.getStatus()
+                                + "; already-confirmed steps will not be re-executed");
+                persist(fresh);
+                log.info("[recover] resuming instance={} from status={}", fresh.getInstanceId(), fresh.getStatus());
+                resume(fresh, resolved);
+                return RecoveryOutcome.RECOVERED;
+            } catch (SagaRejectedException versionConflict) {
+                if (versionConflict.getReason() != RejectReason.VERSION_CONFLICT) {
+                    throw versionConflict;
+                }
+                // 另一个恢复者已经抢先落盘推进：本调用安静认输，后续实例继续处理
+                SagaSnapshot winnerView = peekSnapshotOrNull(scanned.getInstanceId());
+                log.info("[recover] instance={} was advanced by a concurrent recoverer while this call was "
+                                + "resuming it (CAS lost, winnerStatus={}) -> defer quietly, no retry here, "
+                                + "remaining instances keep being recovered",
+                        scanned.getInstanceId(),
+                        winnerView == null ? "unknown" : winnerView.status());
+                return RecoveryOutcome.DEFERRED;
+            }
         } finally {
             lock.unlock();
+        }
+    }
+
+    private SagaSnapshot peekSnapshotOrNull(String instanceId) {
+        try {
+            return toSnapshot(require(instanceId));
+        } catch (RuntimeException e) {
+            return null;
         }
     }
 
@@ -350,18 +492,44 @@ public class SagaOrchestrator {
         ReentrantLock lock = executionLocks.computeIfAbsent(instanceId, k -> new ReentrantLock());
         lock.lock();
         try {
-            SagaInstance inst = require(instanceId);
-            SagaDefinition def = definitions.get(inst.getType());
-            log.info("[compensate] manual trigger instance={} currentStatus={}", instanceId, inst.getStatus());
-            switch (inst.getStatus()) {
-                case COMPENSATION_FAILED, COMPENSATING -> runCompensation(inst, def);
-                case COMPENSATED -> log.info("[compensate] instance={} already COMPENSATED -> idempotent no-op",
-                        instanceId);
-                default -> throw new SagaRejectedException(RejectReason.ILLEGAL_STATE,
-                        "cannot trigger compensation for instance " + instanceId
-                                + " in status " + inst.getStatus());
+            log.info("[compensate] manual trigger instance={}", instanceId);
+            SagaSnapshot snapshot = null;
+            for (int attempt = 1; attempt <= MAX_CAS_ATTEMPTS; attempt++) {
+                SagaInstance inst = require(instanceId);
+                SagaDefinition def = definitions.get(inst.getType());
+                SagaStatus current = inst.getStatus();
+                log.info("[compensate] resume instance={} currentStatus={}", instanceId, current);
+                try {
+                    switch (current) {
+                        case COMPENSATION_FAILED, COMPENSATING -> runCompensation(inst, def);
+                        case COMPENSATED -> log.info(
+                                "[compensate] instance={} already COMPENSATED -> idempotent no-op",
+                                instanceId);
+                        default -> throw new SagaRejectedException(RejectReason.ILLEGAL_STATE,
+                                "cannot trigger compensation for instance " + instanceId
+                                        + " in status " + current);
+                    }
+                    snapshot = toSnapshot(require(instanceId));
+                    break;
+                } catch (SagaRejectedException conflict) {
+                    if (conflict.getReason() != RejectReason.VERSION_CONFLICT) {
+                        throw conflict;
+                    }
+                    log.info("[compensate] instance={} lost optimistic race at attempt={} "
+                            + "(advanced by a concurrent recoverer) -> re-read latest state and converge",
+                            instanceId, attempt);
+                    if (attempt == MAX_CAS_ATTEMPTS) {
+                        throw conflict;
+                    }
+                }
             }
-            return toSnapshot(require(instanceId));
+            if (snapshot == null) {
+                throw new SagaRejectedException(RejectReason.VERSION_CONFLICT,
+                        "triggerCompensation for instance " + instanceId
+                                + " kept losing optimistic races against concurrent recoverers; "
+                                + "call recoverAll or retry");
+            }
+            return snapshot;
         } finally {
             lock.unlock();
         }
