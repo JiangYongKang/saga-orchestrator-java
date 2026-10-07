@@ -12,6 +12,12 @@ public class SagaProperties {
     /** 启动时是否自动恢复未完成实例。 */
     private boolean recoverOnStartup = true;
 
+    /**
+     * 恢复认领的租约时长（毫秒）：多恢复者共享同一存储时，持有认领的恢复者在每次
+     * 状态落盘时续租；持有者崩溃后租约到期，其它恢复者即可接管，实例不会被漏掉。
+     */
+    private long recoveryClaimLeaseMillis = 60_000L;
+
     public String getStoreDir() {
         return storeDir;
     }
@@ -26,5 +32,13 @@ public class SagaProperties {
 
     public void setRecoverOnStartup(boolean recoverOnStartup) {
         this.recoverOnStartup = recoverOnStartup;
+    }
+
+    public long getRecoveryClaimLeaseMillis() {
+        return recoveryClaimLeaseMillis;
+    }
+
+    public void setRecoveryClaimLeaseMillis(long recoveryClaimLeaseMillis) {
+        this.recoveryClaimLeaseMillis = recoveryClaimLeaseMillis;
     }
 }

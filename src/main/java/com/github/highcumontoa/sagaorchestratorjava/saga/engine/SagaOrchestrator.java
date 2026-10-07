@@ -57,6 +57,8 @@ public class SagaOrchestrator {
 
     private static final String PHASE_FORWARD = "FORWARD";
     private static final String PHASE_COMPENSATE = "COMPENSATE";
+    /** 恢复认领的默认租约：持有期间每次状态落盘都会续租，崩溃后由租约过期兜底。 */
+    public static final long DEFAULT_RECOVERY_CLAIM_LEASE_MILLIS = 60_000L;
 
     private final SagaStore store;
     private final IdempotentActionGuard guard;
@@ -71,11 +73,22 @@ public class SagaOrchestrator {
         return t;
     });
     private final AtomicLong fenceCounter = new AtomicLong();
+    /** 本恢复者的稳定标识：写进认领记录，便于排查「谁在推进这个实例」。 */
+    private final String ownerId = "recoverer-" + java.util.UUID.randomUUID();
+    private final long recoveryClaimLeaseMillis;
+    /** 当前线程正持有认领的实例 id：persist 时据此续租，防止长步骤执行期间租约过期。 */
+    private final ThreadLocal<String> activeClaimedInstance = new ThreadLocal<>();
 
     public SagaOrchestrator(SagaStore store) {
+        this(store, DEFAULT_RECOVERY_CLAIM_LEASE_MILLIS);
+    }
+
+    public SagaOrchestrator(SagaStore store, long recoveryClaimLeaseMillis) {
         this.store = store;
+        this.recoveryClaimLeaseMillis = recoveryClaimLeaseMillis;
         this.guard = new IdempotentActionGuard(store);
-        log.info("[orchestrator] created with store {}", store.getClass().getSimpleName());
+        log.info("[orchestrator] created with store {} ownerId={} recoveryClaimLease={}ms",
+                store.getClass().getSimpleName(), ownerId, recoveryClaimLeaseMillis);
     }
 
     // ---------------------------------------------------------------------
@@ -172,31 +185,76 @@ public class SagaOrchestrator {
     // 恢复 / 状态机驱动
     // ---------------------------------------------------------------------
 
-    /** 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。幂等：可重复、可并发调用。 */
+    /**
+     * 重启或重新初始化后，继续所有未完成（含补偿未完成）的实例。幂等：可重复、可并发调用。
+     *
+     * <p>多恢复者语义：多个编排器（启动自动恢复 / 运维手动触发 / 多实例共享同一存储）
+     * 并发调用本方法时，每个实例由认领机制选出唯一推进者；没抢到的恢复者按
+     * 「该实例已经被别人推进」安静收敛，继续处理后续实例——单次冲突不会中断整批、
+     * 不会漏掉其它待恢复实例，任何恢复调用都正常返回。
+     */
     public int recoverAll() {
         List<SagaInstance> all = store.findAll();
         int recovered = 0;
+        int skippedConcurrent = 0;
         for (SagaInstance inst : all) {
-            if (recoverInstance(inst)) {
-                recovered++;
+            try {
+                if (recoverInstance(inst)) {
+                    recovered++;
+                }
+            } catch (ConcurrentRecoveryException e) {
+                skippedConcurrent++;
+                log.info("[recover] instance={} is being advanced by another recoverer ({}) "
+                                + "-> converge quietly and continue with the rest",
+                        inst.getInstanceId(), e.getMessage());
+            } catch (RuntimeException e) {
+                // 单个实例的失败（含版本冲突）不得中断整批恢复
+                log.warn("[recover] instance={} recovery attempt failed ({}); continuing with "
+                        + "remaining instances — a later recoverAll can retry this one",
+                        inst.getInstanceId(), e.getMessage());
             }
         }
-        log.info("[recover] scanned {} instances, resumed {}", all.size(), recovered);
+        log.info("[recover] scanned {} instances, resumed {}, skipped {} claimed-by-others",
+                all.size(), recovered, skippedConcurrent);
         return recovered;
     }
 
     /** 只恢复某个类型的未完成实例（定义晚于恢复扫描注册时的补恢复）。 */
     private void recoverType(String type) {
         for (SagaInstance inst : store.findAll()) {
-            if (type.equals(inst.getType())) {
-                recoverInstance(inst);
+            if (!type.equals(inst.getType())) {
+                continue;
             }
+            try {
+                recoverInstance(inst);
+            } catch (ConcurrentRecoveryException e) {
+                log.info("[recover] deferred recovery: instance={} claimed by another recoverer -> converge",
+                        inst.getInstanceId());
+            } catch (RuntimeException e) {
+                log.warn("[recover] deferred recovery of instance={} failed ({}); "
+                        + "a later recoverAll can retry", inst.getInstanceId(), e.getMessage());
+            }
+        }
+    }
+
+    /** 恢复路径内部的「被其它恢复者推进中」信号：调用方安静收敛，不算失败。 */
+    private static final class ConcurrentRecoveryException extends RuntimeException {
+        ConcurrentRecoveryException(String message) {
+            super(message);
         }
     }
 
     /**
      * 恢复单个实例；返回 true 表示本次调用确实推进了它。
-     * 在实例锁内重读状态：已被并发恢复推进到终态的实例直接收敛，不重复计数、不追加矛盾轨迹。
+     *
+     * <p>并发收敛的三道防线：
+     * <ol>
+     *   <li>进程内实例锁 + 锁内重读：同进程并发的恢复/提交串行化，终态直接收敛；</li>
+     *   <li>存储层恢复认领（带租约）：跨编排器、跨进程只允许一个恢复者推进，
+     *       没抢到的抛 {@link ConcurrentRecoveryException} 由调用方安静跳过；</li>
+     *   <li>乐观版本号兜底：万一仍发生并发推进，过期写入以 VERSION_CONFLICT 被拒，
+     *       同样按「已被别人推进」收敛，绝不作为错误抛出。</li>
+     * </ol>
      */
     private boolean recoverInstance(SagaInstance scanned) {
         SagaStatus status = scanned.getStatus();
@@ -224,13 +282,32 @@ public class SagaOrchestrator {
                         fresh.getInstanceId(), fresh.getType());
                 return false;
             }
-            trace(fresh, TraceType.RECOVERED, null,
-                    "resume after (re)initialisation from status " + fresh.getStatus()
-                            + "; already-confirmed steps will not be re-executed");
-            persist(fresh);
-            log.info("[recover] resuming instance={} from status={}", fresh.getInstanceId(), fresh.getStatus());
-            resume(fresh, resolved);
-            return true;
+            if (!store.tryClaimRecovery(fresh.getInstanceId(), ownerId, recoveryClaimLeaseMillis)) {
+                throw new ConcurrentRecoveryException(
+                        "recovery claim for " + fresh.getInstanceId() + " is held by another recoverer");
+            }
+            try {
+                activeClaimedInstance.set(fresh.getInstanceId());
+                trace(fresh, TraceType.RECOVERED, null,
+                        "resume after (re)initialisation from status " + fresh.getStatus()
+                                + "; already-confirmed steps will not be re-executed"
+                                + "; recovery claimed by " + ownerId);
+                persist(fresh);
+                log.info("[recover] resuming instance={} from status={} (owner={})",
+                        fresh.getInstanceId(), fresh.getStatus(), ownerId);
+                resume(fresh, resolved);
+                return true;
+            } catch (SagaRejectedException e) {
+                if (e.getReason() == RejectReason.VERSION_CONFLICT) {
+                    throw new ConcurrentRecoveryException(
+                            "instance " + fresh.getInstanceId() + " was advanced concurrently: "
+                                    + e.getMessage());
+                }
+                throw e;
+            } finally {
+                activeClaimedInstance.remove();
+                store.releaseRecovery(fresh.getInstanceId(), ownerId);
+            }
         } finally {
             lock.unlock();
         }
@@ -603,6 +680,11 @@ public class SagaOrchestrator {
     private void persist(SagaInstance inst) {
         inst.setUpdatedMillis(System.currentTimeMillis());
         store.update(inst, inst.getVersion());
+        // 恢复认领续租：每次状态落盘都顺延租约，长步骤执行期间其它恢复者不会误判持有者已死
+        String claimed = activeClaimedInstance.get();
+        if (claimed != null && claimed.equals(inst.getInstanceId())) {
+            store.renewRecoveryClaim(claimed, ownerId, recoveryClaimLeaseMillis);
+        }
     }
 
     private void transition(SagaInstance inst,

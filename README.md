@@ -12,7 +12,7 @@
 ## 1. 快速开始
 
 ```bash
-# 运行全部测试（20 个，含单元、持久化、崩溃恢复、Spring 集成测试），无需任何外部服务
+# 运行全部测试（23 个，含单元、持久化、崩溃恢复、并发恢复、Spring 集成测试），无需任何外部服务
 mvn test
 
 # 只跑编排器核心用例（可看到完整的输入/迁移/判定日志）
@@ -20,6 +20,9 @@ mvn test -Dtest=SagaOrchestratorTest
 
 # 只跑在途崩溃恢复用例（动作已下发、确认未落盘时进程被杀）
 mvn test -Dtest=SagaCrashRecoveryTest
+
+# 只跑多恢复者并发恢复用例（多个恢复者指向同一份存储并发恢复 + 恢复后手动补跑）
+mvn test -Dtest=SagaConcurrentRecoveryTest
 ```
 
 默认持久化目录为 `target/saga-store/`（可用配置项覆盖，见第 7 节），
@@ -55,7 +58,7 @@ orch.recoverAll();           // 重启/重新初始化后恢复未完成实例
 | 包 | 职责 |
 | --- | --- |
 | `saga.model` | 状态枚举（`SagaStatus`/`StepStatus`/`TraceType`）、`SagaDefinition`、`SagaInstance`、`StepExecution`、快照与轨迹 |
-| `saga.store` | `SagaStore` 存储抽象、`FileSagaStore`（本地 JSON 文件 + 乐观版本）、`IdempotentActionGuard`（动作级幂等守卫） |
+| `saga.store` | `SagaStore` 存储抽象、`FileSagaStore`（本地 JSON 文件 + 乐观版本 + 恢复认领）、`IdempotentActionGuard`（动作级幂等守卫）、`RecoveryClaim`（恢复认领记录） |
 | `saga.engine` | `SagaOrchestrator`（状态机驱动核心）、`RetryPolicy`（确定重试策略） |
 | `saga.exception` | `SagaRejectedException` + `RejectReason`（可区分拒绝原因） |
 | `saga.config` | Spring 自动装配、配置属性、启动恢复 Runner |
@@ -168,7 +171,11 @@ new StepDefinition("debit", ctx -> {
 ## 6. 并发控制与拒绝原因
 
 - 每实例一把可重入执行锁：同一实例的提交、补偿、恢复串行化；不同实例互不阻塞。
+- **恢复认领（recovery claim）**：跨编排器、跨进程的恢复互斥。恢复者推进实例前先向
+  共享存储认领（带租约），没抢到的恢复者按「该实例已被别人推进」安静收敛并继续处理
+  后续实例；详见 7.2。
 - 乐观版本号：实例每次落盘 `version+1`，过期写入抛 `VERSION_CONFLICT`（HTTP 409）。
+  恢复路径把该冲突同样按「已被并发推进」收敛，不作为错误抛出。
 - 所有被拒绝操作抛 `SagaRejectedException`，携带可枚举区分的 `RejectReason`：
 
 | `RejectReason` | 触发情形 | HTTP |
@@ -183,7 +190,8 @@ new StepDefinition("debit", ctx -> {
 
 ## 7. 重启 / 重新初始化恢复
 
-- 编排器所有状态（实例、步骤、轨迹、守卫）均在每次状态迁移时原子写盘（临时文件 + rename）。
+- 编排器所有状态（实例、步骤、轨迹、守卫）均在每次状态迁移时原子写盘（临时文件 + rename）；
+  恢复认领记录落盘在独立的 `claims/` 子目录（见 7.2）。
 - `recoverAll()`（Spring 启动时由 `SagaStartupRecovery` 自动执行）扫描持久化目录，
   对 `PENDING/RUNNING/COMPENSATING/COMPENSATION_FAILED` 的实例从断点继续：
   - `SUCCEEDED` 步骤跳过、`COMPENSATED` 补偿跳过 —— 不重复执行已确认工作；
@@ -220,8 +228,43 @@ new StepDefinition("debit", ctx -> {
 配置项（`application.properties`）：
 
 ```properties
-saga.store-dir=target/saga-store   # 本地持久化目录
-saga.recover-on-startup=true       # 启动是否自动恢复
+saga.store-dir=target/saga-store          # 本地持久化目录
+saga.recover-on-startup=true              # 启动是否自动恢复
+saga.recovery-claim-lease-millis=60000    # 恢复认领租约时长（见 7.2）
+```
+
+### 7.2 并发 / 多恢复者恢复语义
+
+生产上常见的并发恢复入口：服务启动的自动恢复（`SagaStartupRecovery`）与运维手动
+`recoverAll()` 撞在一起，或多个服务实例共享同一份存储目录各自恢复。规则如下：
+
+1. **恢复认领（recovery claim）**：恢复者推进某个实例前，先向共享存储原子认领
+   （`<store-dir>/claims/<instanceId>.json`，带租约）。认领判定是「读-判定-写」的
+   短临界区，由 JVM 级锁 + 文件锁双重互斥，跨编排器、跨进程都只有唯一推进者。
+2. **没抢到不报错**：认领被其它恢复者持有时，本次调用按「该实例已经被别人推进」
+   安静收敛——不计数、不写矛盾轨迹、**继续处理后续待恢复实例**，整批恢复不会因
+   单次冲突中断，任何恢复调用都正常返回。乐观版本号兜底：万一仍发生并发推进，
+   过期写入的 `VERSION_CONFLICT` 在恢复路径同样按并发收敛处理，不向外抛错。
+3. **租约与接管**：持有者在每次状态落盘时自动续租；持有者崩溃/失联后租约到期，
+   任何恢复者都可接管，实例不会被漏掉。推进结束（无论成败）即释放认领，
+   恢复完成后的手动补跑不受阻。
+4. **副作用不增多**：同一实例同一时刻只有一个恢复者在驱动，已 `DONE` 的守卫记录
+   跨恢复者短路，业务动作不会被重复下发；没做完的补偿按在途崩溃规则重放，不会被
+   跳过。无论恢复跑多少遍、多少个恢复者并发跑，业务侧副作用数量都不变。
+5. **结论一致、可解释**：只有真正推进实例的那个恢复者会写 `RECOVERED` /
+   `IN_FLIGHT_RECOVERED` 轨迹（轨迹中带认领者 `ownerId`），快照中同一实例不会出现
+   「一会儿在途、一会儿终态」的矛盾结论；被跳过的实例保持原落盘状态，等持有者推进。
+6. **对老数据的行为**：认领记录是独立的 `claims/` 目录，功能上线前已落盘的实例与
+   守卫 JSON **无需任何迁移**；认领文件按需创建、推进结束即删除，被杀恢复者遗留的
+   认领文件租约到期后自动失效并被接管。
+
+本地复现与验证：`SagaConcurrentRecoveryTest` 用多个指向同一存储目录的编排器
+并发执行 `recoverAll()`（正向在途崩溃 ×3 + 补偿在途崩溃 ×2），断言所有恢复调用
+正常返回、每个实例恰好被一个恢复者推进、副作用数量不变、终态与轨迹一致；
+另有用例直接构造「有效认领 / 过期认领」文件验证安静跳过与接管语义：
+
+```bash
+mvn test -Dtest=SagaConcurrentRecoveryTest
 ```
 
 ---
@@ -263,6 +306,9 @@ HTTP 接口（`SagaController`）：
 | 补偿动作在途崩溃：补偿既不跳过也不重复生效 | `SagaCrashRecoveryTest.compensationCrashMidFlightIsNeitherSkippedNorDoubled` |
 | 恢复扫描先于定义注册：定义补齐后自动补恢复，不漏实例 | `SagaCrashRecoveryTest.recoveryScanBeforeDefinitionRegistrationStillRecovers` |
 | 并发 + 重复恢复幂等：副作用不增多、结论不矛盾 | `SagaCrashRecoveryTest.concurrentAndRepeatedRecoveryStaysIdempotent` |
+| 多恢复者并发恢复（正向链路）：不报错、恰好一个推进者、副作用不增多 | `SagaConcurrentRecoveryTest.concurrentRecoverersOnForwardChainConvergeWithoutErrors` |
+| 多恢复者并发恢复（补偿链路）：补偿不跳过也不重复生效 | `SagaConcurrentRecoveryTest.concurrentRecoverersOnCompensationChainNeitherSkipNorDouble` |
+| 恢复认领：有效认领安静跳过、过期认领被接管 | `SagaConcurrentRecoveryTest.recoveryClaimIsRespectedAndStaleClaimIsTakenOver` |
 | 稳定去重标识：跨重试不变、不同动作互不撞车 | `SagaCrashRecoveryTest.actionKeyIsStableAcrossRetriesAndUniquePerAction` |
 | 老格式落盘实例免迁移恢复 | `SagaCrashRecoveryTest.legacyPersistedInstanceFromBeforeThisFeatureStillRecovers` |
 | 创建去重、版本冲突、磁盘扫描恢复 | `FileSagaStoreTest` |

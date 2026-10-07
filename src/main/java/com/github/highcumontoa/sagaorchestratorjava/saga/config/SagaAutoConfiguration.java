@@ -20,8 +20,8 @@ public class SagaAutoConfiguration {
     }
 
     @Bean
-    public SagaOrchestrator sagaOrchestrator(SagaStore sagaStore) {
-        return new SagaOrchestrator(sagaStore);
+    public SagaOrchestrator sagaOrchestrator(SagaStore sagaStore, SagaProperties properties) {
+        return new SagaOrchestrator(sagaStore, properties.getRecoveryClaimLeaseMillis());
     }
 
     @Bean
